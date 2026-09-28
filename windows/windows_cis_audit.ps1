@@ -1,952 +1,1416 @@
 <#
 .SYNOPSIS
-    windows_cis_audit.ps1 (v1.0) - технический аудит безопасности Windows
-    Server 2016+/Windows 10-11 (read-only).
+    IT Security LLC - windows_cis_audit.ps1 (v3.0)
+    Technical security audit for Windows 10 / Windows 11 / Windows Server 2016-2025.
 
 .DESCRIPTION
-    Windows-аналог redos_cis_audit.sh v1.1. Ориентирован на технические
-    контроли ISO/IEC 27001 (Annex A: A.8, A.12, A.13) и методологию
-    CIS Benchmarks for Microsoft Windows (Level 1 / Level 2).
+    Windows counterpart of debian_cis_audit.sh. Aligned with ISO/IEC 27001 technical
+    controls (Annex A: A.8, A.12, A.13) and CIS Benchmarks methodology (Level 1 / Level 2).
 
-    Скрипт только ЧИТАЕТ состояние системы. Единственная запись вне отчётов -
-    временный файл secedit в %TEMP% (удаляется в конце).
-      [PASS] - контроль выполнен
-      [WARN] - отклонение от рекомендации / Level 2 / требует внимания
-      [FAIL] - критическое несоответствие (Level 1)
-      [INFO] - информационная строка, не влияет на итоговую оценку
+    This script ONLY READS system state (read-only audit). The only artefacts it writes are
+    its own report files and short-lived temp files (secedit export), which are removed.
+      [PASS] - Control satisfied
+      [WARN] - Deviation / Level 2 / requires attention
+      [FAIL] - Critical non-compliance (Level 1)
+      [INFO] - Informational entry, does not affect score
 
-    Вывод:
-      - консоль (цветной)
-      - <OutputDir>\windows_cis_audit_report.log   (текстовый, накопительно)
-      - <OutputDir>\windows_cis_audit_report.html  (веб-версия, перезаписывается)
+    Output:
+      - Console (colored)
+      - <OutputDir>\windows_cis_audit_report.log    (text report, cumulative)
+      - <OutputDir>\windows_cis_audit_report.html   (interactive web report)
+      - <OutputDir>\windows_cis_audit_results.json  (machine-readable, latest run)
 
-    Коды возврата: 0 = всё PASS, 1 = есть WARN, 2 = есть FAIL, 3 = не admin.
+    Exit codes: 0 = all passed, 1 = warnings only, 2 = at least one FAIL, 3 = not run (no admin / wrong OS)
 
 .PARAMETER OutputDir
-    Каталог отчётов. По умолчанию C:\ProgramData\SecurityAudit
-    (при создании доступ ограничивается SYSTEM + Administrators).
-
-.PARAMETER SkipUpdateSearch
-    Не искать доступные обновления через Windows Update Agent (быстрее,
-    полезно для изолированных серверов без доступа к WSUS/WU).
+    Report directory. Default: %ProgramData%\ITSecurity
 
 .PARAMETER DeepScan
-    Дополнительно: DISM ScanHealth и sfc /verifyonly (аналог rpm -Va).
-    Занимает 5-20 минут.
+    Also run 'sfc /verifyonly' (system file integrity). Slow: can take 10+ minutes.
+
+.PARAMETER SkipUpdateSearch
+    Skip the Windows Update Agent search for pending updates (use on hosts without WU/WSUS reachability).
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows_cis_audit.ps1
-
-.EXAMPLE
-    .\windows_cis_audit.ps1 -SkipUpdateSearch -OutputDir D:\audit
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$OutputDir = (Join-Path $env:ProgramData 'SecurityAudit'),
-    [switch]$SkipUpdateSearch,
-    [switch]$DeepScan
+    [string]$OutputDir = (Join-Path $env:ProgramData 'ITSecurity'),
+    [switch]$DeepScan,
+    [switch]$SkipUpdateSearch
 )
 
-$ErrorActionPreference = 'SilentlyContinue'   # аналог 2>/dev/null; ошибки обрабатываются явно
+$ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
 
 # ============================================================================
-# 0. ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ И ИНИЦИАЛИЗАЦИЯ
+# 0. GLOBAL PARAMETERS & INITIALIZATION
 # ============================================================================
 
-$script:ScriptVersion = '1.0'
-$script:AuditorName   = 'IT Security LLC'
-$script:ReportFile    = Join-Path $OutputDir 'windows_cis_audit_report.log'
-$script:HtmlFile      = Join-Path $OutputDir 'windows_cis_audit_report.html'
-$script:RunTs         = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
+$script:Version     = '3.0'
+$script:AuditorName = 'IT Security LLC'
+$ReportFile         = Join-Path $OutputDir 'windows_cis_audit_report.log'
+$HtmlReportFile     = Join-Path $OutputDir 'windows_cis_audit_report.html'
+$JsonReportFile     = Join-Path $OutputDir 'windows_cis_audit_results.json'
+$RunTs              = Get-Date
+$RunTsText          = $RunTs.ToString('yyyy-MM-dd HH:mm:ss zzz')
 
 $script:CountPass = 0
 $script:CountWarn = 0
 $script:CountFail = 0
 $script:CountInfo = 0
 $script:Findings      = New-Object System.Collections.Generic.List[object]
-$script:TextBuffer    = New-Object System.Collections.Generic.List[string]
-$script:CurrentSection = ''
+$script:ReportLines   = New-Object System.Collections.Generic.List[string]
+$script:CurrentSection = '1. INITIALIZATION AND OS INFORMATION'
 
-function Write-Log {
+function Write-Raw {
     param([string]$Text = '', [string]$Color = '')
     if ($Color) { Write-Host $Text -ForegroundColor $Color } else { Write-Host $Text }
-    [void]$script:TextBuffer.Add($Text)
+    [void]$script:ReportLines.Add($Text)
+}
+
+function Write-Section {
+    param([string]$Title)
+    $script:CurrentSection = $Title
+    Write-Raw ''
+    Write-Raw ('=' * 66) 'Cyan'
+    Write-Raw " $Title" 'Cyan'
+    Write-Raw ('=' * 66) 'Cyan'
 }
 
 function Write-Tagged {
-    param([string]$Tag, [string]$Color, [string]$Msg)
+    param([string]$Tag, [string]$Color, [string]$Msg, [string]$Rem = '')
     Write-Host '  ' -NoNewline
     Write-Host "[$Tag]" -ForegroundColor $Color -NoNewline
     Write-Host " $Msg"
-    [void]$script:TextBuffer.Add("  [$Tag] $Msg")
-}
-
-function Add-Finding {
-    param([string]$Level, [string]$Msg, [string]$Rem)
+    [void]$script:ReportLines.Add("  [$Tag] $Msg")
+    if ($Rem) {
+        $line = "         -> Recommendation: $Rem"
+        Write-Host $line
+        [void]$script:ReportLines.Add($line)
+    }
     [void]$script:Findings.Add([pscustomobject]@{
-        Level = $Level; Section = $script:CurrentSection; Message = $Msg; Remediation = $Rem })
+        Level = $Tag; Section = $script:CurrentSection; Message = $Msg; Remediation = $Rem })
 }
 
-function Start-Section {
-    param([string]$Title)
-    $script:CurrentSection = $Title
-    Write-Log ''
-    Write-Log ('=' * 66) 'Cyan'
-    Write-Log " $Title" 'Cyan'
-    Write-Log ('=' * 66) 'Cyan'
-}
+function Add-Pass { param([string]$Msg)                    $script:CountPass++; Write-Tagged 'PASS' 'Green'  $Msg '' }
+function Add-Warn { param([string]$Msg, [string]$Rem = '') $script:CountWarn++; Write-Tagged 'WARN' 'Yellow' $Msg $Rem }
+function Add-Fail { param([string]$Msg, [string]$Rem = '') $script:CountFail++; Write-Tagged 'FAIL' 'Red'    $Msg $Rem }
+function Add-Info { param([string]$Msg)                    $script:CountInfo++; Write-Tagged 'INFO' 'White'  $Msg '' }
 
-function Add-Pass { param([string]$Msg)
-    $script:CountPass++
-    Write-Tagged 'PASS' 'Green' $Msg
-    Add-Finding 'PASS' $Msg ''
-}
-function Add-Warn { param([string]$Msg, [string]$Rem = '')
-    $script:CountWarn++
-    Write-Tagged 'WARN' 'Yellow' $Msg
-    if ($Rem) { Write-Log "         -> Рекомендация: $Rem" }
-    Add-Finding 'WARN' $Msg $Rem
-}
-function Add-Fail { param([string]$Msg, [string]$Rem = '')
-    $script:CountFail++
-    Write-Tagged 'FAIL' 'Red' $Msg
-    if ($Rem) { Write-Log "         -> Рекомендация: $Rem" }
-    Add-Finding 'FAIL' $Msg $Rem
-}
-function Add-Info { param([string]$Msg)
-    $script:CountInfo++
-    Write-Tagged 'INFO' 'Cyan' $Msg
-    Add-Finding 'INFO' $Msg ''
-}
-function Add-Sev { param([string]$Sev, [string]$Msg, [string]$Rem = '')
+function Add-Result {
+    param([string]$Sev, [string]$Msg, [string]$Rem = '')
     if ($Sev -eq 'FAIL') { Add-Fail $Msg $Rem } else { Add-Warn $Msg $Rem }
-}
-
-function Test-IsAdmin {
-    try {
-        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-        return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { return $false }
 }
 
 function Get-RegValue {
     param([string]$Path, [string]$Name)
-    try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name }
-    catch { return $null }
+    try { (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { $null }
 }
 
-# Универсальная проверка DWORD-параметра реестра (аналог цикла по SYSCTL_EXPECTED).
-# DefaultIfMissing: значение, которое ОС применяет, если параметр не задан
-# (ключевой урок v1.1 Linux-скрипта: "не задано" != "небезопасно", если default безопасный).
-function Test-RegSetting {
-    param(
-        [string]$Path, [string]$Name, [int64]$Expected, [string]$Desc,
-        [ValidateSet('eq', 'ge', 'le')][string]$Op = 'eq',
-        [ValidateSet('FAIL', 'WARN')][string]$Severity = 'WARN',
-        $DefaultIfMissing = $null,
-        [string]$Rem = ''
-    )
-    if (-not $Rem) {
-        $Rem = "New-Item -Path '$Path' -Force | Out-Null; New-ItemProperty -Path '$Path' -Name '$Name' -Value $Expected -PropertyType DWord -Force"
-    }
-    $val = Get-RegValue $Path $Name
-    $src = ''
-    if ($null -eq $val -and $null -ne $DefaultIfMissing) { $val = $DefaultIfMissing; $src = ' [default ОС]' }
-    if ($null -eq $val) {
-        Add-Sev $Severity "${Desc}: параметр ${Name} не задан" $Rem
-        return
-    }
-    $ok = switch ($Op) {
-        'eq' { [int64]$val -eq $Expected }
-        'ge' { [int64]$val -ge $Expected }
-        'le' { [int64]$val -le $Expected }
-    }
-    $opText = @{ eq = '='; ge = '>='; le = '<=' }[$Op]
-    if ($ok) { Add-Pass "${Desc}: ${Name} = ${val}${src}" }
-    else     { Add-Sev $Severity "${Desc}: ${Name} = ${val}${src} (ожидается ${opText} ${Expected})" $Rem }
+function New-RegFix {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+    "New-Item -Path '$Path' -Force | Out-Null; New-ItemProperty -Path '$Path' -Name '$Name' -Value $Value -PropertyType $Type -Force | Out-Null"
 }
 
-# Проверка прав на файл/каталог: Everyone / Authenticated Users / Users
-# не должны иметь запись/удаление/смену прав (аналог check_perm).
-# Сравнение по SID, а не по имени - не зависит от локализации ОС.
-function Test-WeakAcl {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { Add-Info "${Path} не существует - пропущено"; return }
-    $weak = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'Users' }
-    $mask = 0x500D0046   # WriteData|AppendData|DeleteSubdirs|Delete|ChangePerms|TakeOwner|GenericWrite|GenericAll
-    $bad = @()
-    $acl = Get-Acl -LiteralPath $Path
-    if (-not $acl) { Add-Warn "${Path}: не удалось прочитать ACL"; return }
-    foreach ($ace in $acl.Access) {
-        if ($ace.AccessControlType -ne 'Allow') { continue }
-        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-        catch { continue }
-        if ($weak.ContainsKey($sid) -and (([int]$ace.FileSystemRights -band $mask) -ne 0)) {
-            $bad += ('{0}:{1}' -f $weak[$sid], $ace.FileSystemRights)
-        }
-    }
-    if ($bad.Count -eq 0) { Add-Pass "${Path}: нет прав записи у Everyone/Users/Authenticated Users" }
-    else {
-        Add-Fail "${Path}: избыточные права: $($bad -join '; ')" `
-                 "icacls `"$Path`" /remove:g *S-1-1-0 *S-1-5-11 *S-1-5-32-545 (затем выдать только Read/Execute группе Users)"
-    }
-}
-
-function Get-SecPolicy {
-    $cfg = Join-Path $env:TEMP ('secpol_{0}.inf' -f [guid]::NewGuid().ToString('N'))
-    $map = @{}
+function Test-Cmp {
+    param($Actual, [string]$Op, $Value)
     try {
-        & secedit.exe /export /cfg $cfg /areas SECURITYPOLICY USER_RIGHTS 2>&1 | Out-Null
-        if (Test-Path -LiteralPath $cfg) {
-            foreach ($line in (Get-Content -LiteralPath $cfg)) {
-                if ($line -match '^\s*([^=\[;]+?)\s*=\s*(.*?)\s*$') { $map[$Matches[1]] = $Matches[2] }
-            }
+        switch ($Op) {
+            'eq'    { return ([string]$Actual -eq [string]$Value) }
+            'le'    { return ([int64]$Actual -le [int64]$Value) }
+            'ge'    { return ([int64]$Actual -ge [int64]$Value) }
+    'gem1'  { return ([int64]$Actual -eq -1 -or [int64]$Actual -ge [int64]$Value) }   # -1 = never auto-unlock (compliant)
+            'range' { return ([int64]$Actual -ge [int64]$Value[0] -and [int64]$Actual -le [int64]$Value[1]) }
         }
-    } finally { Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue }
-    return $map
+    } catch { return $false }
+    return $false
+}
+
+# Registry-driven checks (equivalent of the SYSCTL_EXPECTED table in the Linux script).
+# Entry keys: Path, Name, Value, Desc, [Op=eq|le|ge|range] [Sev=FAIL|WARN] [Default=$true -> missing value is compliant]
+function Test-RegTable {
+    param([object[]]$Table)
+    foreach ($t in $Table) {
+        $op  = if ($t.Op)  { $t.Op }  else { 'eq' }
+        $sev = if ($t.Sev) { $t.Sev } else { 'FAIL' }
+        $expTxt = if ($op -eq 'range') { "$($t.Value[0])-$($t.Value[1])" } elseif ($op -eq 'le') { "<= $($t.Value)" } elseif ($op -eq 'ge') { ">= $($t.Value)" } else { "$($t.Value)" }
+        $fixVal = if ($op -eq 'range') { $t.Value[1] } else { $t.Value }
+        $fix = New-RegFix $t.Path $t.Name $fixVal
+        $actual = Get-RegValue $t.Path $t.Name
+        if ($null -eq $actual) {
+            if ($t.Default) { Add-Pass "$($t.Desc): not configured - OS default is compliant ($($t.Name))" }
+            else            { Add-Result $sev "$($t.Desc): not configured (expected: $expTxt) [$($t.Name)]" $fix }
+        }
+        elseif (Test-Cmp $actual $op $t.Value) { Add-Pass "$($t.Desc): $($t.Name) = $actual (expected: $expTxt)" }
+        else { Add-Result $sev "$($t.Desc): $($t.Name) = $actual (expected: $expTxt)" $fix }
+    }
+}
+
+function Get-SidString {
+    param($Identity)
+    try {
+        if ($Identity -is [System.Security.Principal.SecurityIdentifier]) { return $Identity.Value }
+        return (New-Object System.Security.Principal.NTAccount([string]$Identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch { return $null }
 }
 
 # ============================================================================
-# 1. ПРОВЕРКА ЗАПУСКА ОТ ADMINISTRATOR
+# 1. ADMIN CHECK AND OS INFORMATION
 # ============================================================================
 
-if (-not (Test-IsAdmin)) {
-    Write-Host '[FAIL] Скрипт должен быть запущен от имени Администратора (elevated PowerShell).' -ForegroundColor Red
-    Write-Host "Текущий пользователь: $env:USERNAME"
-    Write-Host 'Повторите запуск: правый клик по PowerShell -> "Запуск от имени администратора".'
+Write-Section '1. INITIALIZATION AND OS INFORMATION'
+
+if ($env:OS -ne 'Windows_NT') {
+    Write-Host '[FAIL] This script targets Windows only.' -ForegroundColor Red
     exit 3
 }
 
-$cs = Get-CimInstance Win32_ComputerSystem
-$os = Get-CimInstance Win32_OperatingSystem
-$HostFqdn = $env:COMPUTERNAME
-if ($cs -and $cs.PartOfDomain -and $cs.DNSHostName) { $HostFqdn = "$($cs.DNSHostName).$($cs.Domain)" }
-$OsInfo = 'неизвестно'
-if ($os) { $OsInfo = '{0} (build {1}, {2})' -f $os.Caption.Trim(), $os.BuildNumber, $os.OSArchitecture }
-$IsDC     = [bool]($os -and $os.ProductType -eq 2)
-$IsServer = [bool]($os -and $os.ProductType -ne 1)
-
-Write-Log 'Технический аудит безопасности (CIS / ISO 27001) - Windows' 'White'
-Write-Log "Версия скрипта : $script:ScriptVersion"
-Write-Log "Хост           : $HostFqdn"
-Write-Log "Дата/время     : $script:RunTs"
-Write-Log "ОС             : $OsInfo"
-$OsRole = if ($IsDC) { 'Контроллер домена' } elseif ($IsServer) { 'Сервер' } else { 'Рабочая станция' }
-Write-Log "Роль ОС        : $OsRole"
-Write-Log "PowerShell     : $($PSVersionTable.PSVersion)"
-Write-Log "Файл отчёта    : $script:ReportFile"
-if (-not $os -or $os.Caption -notmatch 'Windows') {
-    Add-Info 'Не удалось определить ОС через CIM (Win32_OperatingSystem) - часть проверок может быть пропущена'
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $IsAdmin) {
+    Write-Host '[FAIL] Script must be run from an elevated session (Run as Administrator).' -ForegroundColor Red
+    Write-Host "Current user: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)" -ForegroundColor Red
+    Write-Host 'Re-run using: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows_cis_audit.ps1' -ForegroundColor Red
+    exit 3
 }
-if ($IsDC) { Add-Info 'Обнаружен контроллер домена: проверки локальных учётных записей неприменимы (используйте AD-специфичные CIS-бенчмарки)' }
+
+$OsCim  = Get-CimInstance Win32_OperatingSystem
+$CsCim  = Get-CimInstance Win32_ComputerSystem
+$NtKey  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$Build  = [int]$OsCim.BuildNumber
+$Ubr    = Get-RegValue $NtKey 'UBR'
+$DispVer   = Get-RegValue $NtKey 'DisplayVersion'
+$EditionId = [string](Get-RegValue $NtKey 'EditionID')
+$ProductType = [int]$OsCim.ProductType            # 1 = workstation, 2 = domain controller, 3 = server
+$IsServer = ($ProductType -ne 1)
+$IsDC     = ($ProductType -eq 2)
+$IsDomainJoined = [bool]$CsCim.PartOfDomain
+$DomainRoleText = switch ([int]$CsCim.DomainRole) {
+    0 { 'Standalone workstation' } 1 { 'Member workstation' } 2 { 'Standalone server' }
+    3 { 'Member server' } 4 { 'Backup domain controller' } 5 { 'Primary domain controller' } default { 'Unknown' } }
+
+$HostFqdn = if ($IsDomainJoined -and $CsCim.DNSHostName) { "$($CsCim.DNSHostName).$($CsCim.Domain)" } else { $env:COMPUTERNAME }
+$OsInfo   = "$($OsCim.Caption.Trim())" + $(if ($DispVer) { " $DispVer" } else { '' })
+$BuildInfo = "$($OsCim.BuildNumber)" + $(if ($null -ne $Ubr) { ".$Ubr" } else { '' })
+$Up = $RunTs - $OsCim.LastBootUpTime
+$UptimeInfo = '{0} days, {1} hours, {2} minutes' -f $Up.Days, $Up.Hours, $Up.Minutes
+
+Write-Raw 'Technical Security Audit (CIS / ISO 27001) - Windows 10 / 11 / Server'
+Write-Raw "Script Version : $script:Version"
+Write-Raw "Host           : $HostFqdn"
+Write-Raw "Date/Time      : $RunTsText"
+Write-Raw "Report File    : $ReportFile"
+Write-Raw "OS             : $OsInfo"
+Write-Raw "OS Build       : $BuildInfo   (edition: $EditionId)"
+Write-Raw "Role           : $DomainRoleText   (ProductType=$ProductType)"
+Write-Raw "PowerShell     : $($PSVersionTable.PSVersion)"
+
+if ($OsCim.Caption -match 'Windows (10|11|Server)') {
+    Add-Pass "Detected supported Windows family: $OsInfo (build $BuildInfo)"
+} else {
+    Add-Warn "OS not recognized as Windows 10/11/Server ($($OsCim.Caption)); some checks might not apply" `
+             'Run this audit on Windows 10/11 or Windows Server 2016+'
+}
+if ($PSVersionTable.PSVersion.Major -ge 5) { } else { Add-Warn 'Windows PowerShell older than 5.1 detected' 'Install WMF 5.1' }
 
 # ============================================================================
-# 2. АУДИТ ПОДСИСТЕМЫ ЛОГИРОВАНИЯ (EventLog / Advanced Audit Policy / PowerShell / Sysmon / Wazuh)
+# 2. LOGGING & AUDIT SUBSYSTEM (Event Log / Advanced Audit Policy / PowerShell)
 # ============================================================================
 
-Start-Section '2. АУДИТ ПОДСИСТЕМЫ ЛОГИРОВАНИЯ (EventLog / Audit Policy / PowerShell / Sysmon)'
+Write-Section '2. LOGGING AND AUDIT SUBSYSTEM (Event Log / Advanced Audit Policy / PowerShell logging)'
 
-$evt = Get-Service -Name EventLog
-if ($evt -and $evt.Status -eq 'Running') { Add-Pass 'Служба Windows Event Log (EventLog) запущена' }
-else { Add-Fail 'Служба EventLog не запущена' 'Set-Service EventLog -StartupType Automatic; Start-Service EventLog' }
+$svc = Get-Service -Name EventLog
+if ($svc -and $svc.Status -eq 'Running') { Add-Pass 'Windows Event Log service is running' }
+else { Add-Fail 'Windows Event Log service is NOT running' 'Set-Service EventLog -StartupType Automatic; Start-Service EventLog' }
 
-# Размеры журналов (CIS 18.10.x): Security >= 196608 KB, Application/System >= 32768 KB
-foreach ($r in @(
-        @{ N = 'Security';    KB = 196608; Sev = 'FAIL' },
-        @{ N = 'Application'; KB = 32768;  Sev = 'WARN' },
-        @{ N = 'System';      KB = 32768;  Sev = 'WARN' })) {
-    $l = Get-WinEvent -ListLog $r.N
-    if (-not $l) { Add-Warn "Журнал $($r.N) недоступен"; continue }
-    $kb = [math]::Floor($l.MaximumSizeInBytes / 1KB)
-    if ($kb -ge $r.KB) { Add-Pass "Журнал $($r.N): максимальный размер ${kb} KB (>= $($r.KB) KB)" }
-    else {
-        Add-Sev $r.Sev "Журнал $($r.N): максимальный размер ${kb} KB (рекомендуется >= $($r.KB) KB)" `
-                "wevtutil sl $($r.N) /ms:$($r.KB * 1024)"
+foreach ($l in @(@{ N = 'Security'; KB = 196608 }, @{ N = 'System'; KB = 32768 }, @{ N = 'Application'; KB = 32768 })) {
+    $log = Get-WinEvent -ListLog $l.N -ErrorAction SilentlyContinue
+    if (-not $log) { Add-Warn "Event log '$($l.N)' could not be queried"; continue }
+    $kb = [math]::Round($log.MaximumSizeInBytes / 1KB)
+    if ($kb -ge $l.KB) { Add-Pass "$($l.N) log max size $kb KB (>= $($l.KB) KB), mode: $($log.LogMode)" }
+    else { Add-Warn "$($l.N) log max size $kb KB (recommended >= $($l.KB) KB)" "wevtutil sl $($l.N) /ms:$($l.KB * 1024)" }
+}
+
+# Advanced Audit Policy (auditpol, keyed by subcategory GUID = locale independent)
+$AuditPol = @{}
+try {
+    $raw = & auditpol.exe /get /category:* /r 2>$null
+    if ($LASTEXITCODE -eq 0 -and $raw) {
+        $raw | Where-Object { $_ -and $_.Trim() } | Select-Object -Skip 1 |
+            ConvertFrom-Csv -Header 'Machine', 'Target', 'Subcategory', 'GUID', 'Inclusion', 'Exclusion' |
+            ForEach-Object { $AuditPol[$_.GUID.Trim('{}').ToUpper()] = [string]$_.Inclusion }
     }
-    Add-Info "Журнал $($r.N): режим $($l.LogMode), включён: $($l.IsEnabled)"
+} catch { }
+
+$AuditExpect = @(
+    @{ G = '0CCE923F-69AE-11D9-BED3-505054503030'; N = 'Credential Validation';           R = 'SF' },
+    @{ G = '0CCE9237-69AE-11D9-BED3-505054503030'; N = 'Security Group Management';       R = 'S'  },
+    @{ G = '0CCE9235-69AE-11D9-BED3-505054503030'; N = 'User Account Management';         R = 'SF' },
+    @{ G = '0CCE922B-69AE-11D9-BED3-505054503030'; N = 'Process Creation';                R = 'S'  },
+    @{ G = '0CCE9215-69AE-11D9-BED3-505054503030'; N = 'Logon';                           R = 'SF' },
+    @{ G = '0CCE9216-69AE-11D9-BED3-505054503030'; N = 'Logoff';                          R = 'S'  },
+    @{ G = '0CCE9217-69AE-11D9-BED3-505054503030'; N = 'Account Lockout';                 R = 'F'  },
+    @{ G = '0CCE921B-69AE-11D9-BED3-505054503030'; N = 'Special Logon';                   R = 'S'  },
+    @{ G = '0CCE922F-69AE-11D9-BED3-505054503030'; N = 'Audit Policy Change';             R = 'S'  },
+    @{ G = '0CCE9230-69AE-11D9-BED3-505054503030'; N = 'Authentication Policy Change';    R = 'S'  },
+    @{ G = '0CCE9228-69AE-11D9-BED3-505054503030'; N = 'Sensitive Privilege Use';         R = 'SF' },
+    @{ G = '0CCE9210-69AE-11D9-BED3-505054503030'; N = 'Security State Change';           R = 'S'  },
+    @{ G = '0CCE9211-69AE-11D9-BED3-505054503030'; N = 'Security System Extension';       R = 'S'  },
+    @{ G = '0CCE9212-69AE-11D9-BED3-505054503030'; N = 'System Integrity';                R = 'SF' },
+    @{ G = '0CCE9245-69AE-11D9-BED3-505054503030'; N = 'Removable Storage';               R = 'SF' },
+    @{ G = '0CCE9236-69AE-11D9-BED3-505054503030'; N = 'Computer Account Management';     R = 'S';  DC = $true },
+    @{ G = '0CCE923C-69AE-11D9-BED3-505054503030'; N = 'Directory Service Changes';       R = 'S';  DC = $true },
+    @{ G = '0CCE9242-69AE-11D9-BED3-505054503030'; N = 'Kerberos Authentication Service'; R = 'SF'; DC = $true },
+    @{ G = '0CCE9240-69AE-11D9-BED3-505054503030'; N = 'Kerberos Service Ticket Operations'; R = 'SF'; DC = $true }
+)
+
+if ($AuditPol.Count -eq 0) {
+    Add-Warn 'auditpol returned no data - Advanced Audit Policy could not be verified' 'Run: auditpol /get /category:*'
+} else {
+    $auditLocaleWarned = $false
+    foreach ($a in $AuditExpect) {
+        if ($a.DC -and -not $IsDC) { continue }
+        $cur = $AuditPol[$a.G]
+        if ($null -eq $cur) { Add-Info "Audit subcategory '$($a.N)': not present on this OS build - skipped"; continue }
+        if ($cur -notmatch 'Success|Failure|No Auditing') {
+            if (-not $auditLocaleWarned) { Add-Info "auditpol output is not in English ('$cur') - audit subcategory values cannot be interpreted"; $auditLocaleWarned = $true }
+            continue
+        }
+        $hasS = $cur -match 'Success'; $hasF = $cur -match 'Failure'
+        $needS = $a.R -match 'S';      $needF = $a.R -match 'F'
+        $okS = (-not $needS) -or $hasS;  $okF = (-not $needF) -or $hasF
+        $expTxt = @(@(if ($needS) { 'Success' }) + @(if ($needF) { 'Failure' })) -join ' and '
+        if ($okS -and $okF) { Add-Pass "Audit '$($a.N)': $cur (required: $expTxt)" }
+        else {
+            $fixArgs = "$(if ($needS) { ' /success:enable' })$(if ($needF) { ' /failure:enable' })"
+            Add-Fail "Audit '$($a.N)': $cur (required: $expTxt)" "auditpol /set /subcategory:`"{$($a.G)}`"$fixArgs"
+        }
+    }
 }
 
-# Advanced Audit Policy. Сопоставление по GUID подкатегории и разбор
-# Inclusion Setting с учётом RU/EN локали (auditpol локализует и заголовки, и значения).
-Test-RegSetting -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'SCENoApplyLegacyAuditPolicy' `
-    -Expected 1 -Severity WARN -Desc 'Advanced Audit Policy имеет приоритет над legacy-категориями (CIS 2.3.2.1)'
+$LogPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+Test-RegTable @(
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'SCENoApplyLegacyAuditPolicy'; Value = 1; Desc = 'Force audit policy subcategory settings to override legacy category settings' },
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'; Name = 'ProcessCreationIncludeCmdLine_Enabled'; Value = 1; Desc = 'Include command line in process creation events (4688)' },
+    @{ Path = "$LogPath\ScriptBlockLogging"; Name = 'EnableScriptBlockLogging'; Value = 1; Desc = 'PowerShell Script Block Logging' },
+    @{ Path = "$LogPath\ModuleLogging";      Name = 'EnableModuleLogging';      Value = 1; Desc = 'PowerShell Module Logging'; Sev = 'WARN' },
+    @{ Path = "$LogPath\Transcription";      Name = 'EnableTranscripting';      Value = 1; Desc = 'PowerShell Transcription'; Sev = 'WARN' }
+)
 
-if (Get-Command auditpol.exe -ErrorAction SilentlyContinue) {
-    $rows = @(& auditpol.exe /get /category:* /r 2>$null |
-              Where-Object { $_ -match '\{[0-9A-Fa-f-]{36}\}' } |
-              ConvertFrom-Csv -Header m, t, sub, guid, inc, exc)
-    if ($rows.Count -eq 0) {
-        Add-Warn 'auditpol не вернул данных о подкатегориях аудита' 'Проверить вручную: auditpol /get /category:*'
-    } else {
-        $auditMap = @{}
-        foreach ($r in $rows) { $auditMap[$r.guid.Trim('{', '}').ToUpper()] = $r }
-        $base = '-69AE-11D9-BED3-505054503030'
-        # ID|Имя|Need(S/F/SF)|Severity
-        $expected = @(
-            '0CCE923F|Credential Validation|SF|FAIL',
-            '0CCE9235|User Account Management|SF|FAIL',
-            '0CCE9237|Security Group Management|S|FAIL',
-            '0CCE922B|Process Creation|S|FAIL',
-            '0CCE9215|Logon|SF|FAIL',
-            '0CCE9216|Logoff|S|WARN',
-            '0CCE9217|Account Lockout|F|FAIL',
-            '0CCE921C|Other Logon/Logoff Events|SF|WARN',
-            '0CCE921B|Special Logon|S|FAIL',
-            '0CCE9249|Group Membership|S|WARN',
-            '0CCE9224|File Share|SF|WARN',
-            '0CCE9244|Detailed File Share|F|WARN',
-            '0CCE9245|Removable Storage|SF|WARN',
-            '0CCE922F|Audit Policy Change|S|FAIL',
-            '0CCE9230|Authentication Policy Change|S|WARN',
-            '0CCE9231|Authorization Policy Change|S|WARN',
-            '0CCE9232|MPSSVC Rule-Level Policy Change|SF|WARN',
-            '0CCE9234|Other Policy Change Events|F|WARN',
-            '0CCE9228|Sensitive Privilege Use|SF|FAIL',
-            '0CCE9213|IPsec Driver|SF|WARN',
-            '0CCE9214|Other System Events|SF|WARN',
-            '0CCE9210|Security State Change|S|FAIL',
-            '0CCE9211|Security System Extension|S|FAIL',
-            '0CCE9212|System Integrity|SF|FAIL'
-        )
-        foreach ($e in $expected) {
-            $p = $e.Split('|'); $guid = $p[0] + $base; $name = $p[1]; $need = $p[2]; $sev = $p[3]
-            $row = $auditMap[$guid]
-            if (-not $row) { Add-Info "Подкатегория аудита '${name}' не найдена в выводе auditpol - пропущено"; continue }
-            $inc  = "$($row.inc)"
-            $hasS = $inc -match 'Success|Успех|Успешн'
-            $hasF = $inc -match 'Failure|Сбой|Отказ|Ошибк'
-            $needS = $need.Contains('S'); $needF = $need.Contains('F')
-            $okS = (-not $needS) -or $hasS
-            $okF = (-not $needF) -or $hasF
-            $needTxt = @(@('Success') * [int]$needS + @('Failure') * [int]$needF) -join '+'
-            if ($okS -and $okF) { Add-Pass "Аудит '${name}': '${inc}' (требуется: ${needTxt})" }
-            else {
-                $flags = ''
-                if ($needS) { $flags += ' /success:enable' }
-                if ($needF) { $flags += ' /failure:enable' }
-                Add-Sev $sev "Аудит '${name}': '${inc}' (требуется: ${needTxt})" `
-                        "auditpol /set /subcategory:`"{$guid}`"$flags"
+$w32 = Get-Service -Name W32Time
+if ($w32 -and $w32.Status -eq 'Running') {
+    Add-Pass 'Windows Time service (W32Time) is running'
+    $tsrc = (& w32tm.exe /query /source 2>$null | Out-String).Trim()
+    if ($tsrc) { Add-Info "Time source: $tsrc" }
+} else { Add-Warn 'Windows Time service (W32Time) is not running - log timestamps may drift' 'Set-Service W32Time -StartupType Automatic; Start-Service W32Time' }
+
+$sysmon = @(Get-Service | Where-Object { $_.Name -match '^Sysmon' -and $_.Status -eq 'Running' })
+if ($sysmon.Count -gt 0) { Add-Pass "Sysmon is running ($($sysmon[0].Name))" }
+else { Add-Warn 'Sysmon is not installed/running - reduced endpoint telemetry (Level 2)' 'Deploy Sysmon with a maintained config (e.g. SwiftOnSecurity / Olaf Hartong modular)' }
+
+$wazuh = @(Get-Service -Name WazuhSvc, OssecSvc -ErrorAction SilentlyContinue)
+if ($wazuh.Count -gt 0 -and $wazuh[0].Status -eq 'Running') { Add-Pass "Wazuh agent service is running ($($wazuh[0].Name))" }
+elseif ($wazuh.Count -gt 0) { Add-Fail "Wazuh agent service is installed but $($wazuh[0].Status)" "Start-Service $($wazuh[0].Name)" }
+else { Add-Info 'Wazuh agent service not found on this host' }
+
+# ============================================================================
+# 3. NETWORK SECURITY, OPEN PORTS, AND FIREWALL
+# ============================================================================
+
+Write-Section '3. NETWORK SECURITY, PROTOCOLS AND FIREWALL'
+
+$procMap = @{}
+Get-Process | ForEach-Object { $procMap[[int]$_.Id] = $_.ProcessName }
+$tcp = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Sort-Object LocalPort)
+$udp = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Sort-Object LocalPort)
+if ($tcp.Count -gt 0 -or $udp.Count -gt 0) {
+    Add-Info "Gathering listening endpoints via Get-NetTCPConnection / Get-NetUDPEndpoint"
+    foreach ($c in $tcp) { Write-Raw ('         tcp  {0,-40} pid={1} ({2})' -f "$($c.LocalAddress):$($c.LocalPort)", $c.OwningProcess, $procMap[[int]$c.OwningProcess]) }
+    foreach ($c in $udp) { Write-Raw ('         udp  {0,-40} pid={1} ({2})' -f "$($c.LocalAddress):$($c.LocalPort)", $c.OwningProcess, $procMap[[int]$c.OwningProcess]) }
+    Add-Info "Total listening sockets (TCP LISTEN / UDP): $($tcp.Count + $udp.Count)"
+    $wild = @($tcp | Where-Object { $_.LocalAddress -in '0.0.0.0', '::' } | Select-Object -ExpandProperty LocalPort -Unique)
+    if ($wild.Count -gt 0) {
+        Add-Warn "Detected $($wild.Count) TCP ports listening on all interfaces (0.0.0.0/::): $($wild -join ', ')" `
+                 'Restrict service bind addresses; close unused ports with Windows Firewall inbound rules'
+    }
+} else {
+    Add-Info 'Get-NetTCPConnection unavailable, falling back to netstat -ano'
+    & netstat.exe -ano 2>$null | Select-String 'LISTENING|UDP' | ForEach-Object { Write-Raw "         $($_.Line.Trim())" }
+}
+
+$fwp = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+if ($fwp.Count -eq 0) {
+    Add-Fail 'Windows Firewall state could not be queried (MpsSvc stopped or third-party firewall only)' 'Set-Service MpsSvc -StartupType Automatic; Start-Service MpsSvc'
+} else {
+    foreach ($p in $fwp) {
+        $n = $p.Name
+        if ("$($p.Enabled)" -eq 'True') { Add-Pass "Windows Firewall ($n profile) is enabled" }
+        else { Add-Fail "Windows Firewall ($n profile) is DISABLED" "Set-NetFirewallProfile -Profile $n -Enabled True" }
+        if ("$($p.DefaultInboundAction)" -eq 'Block') { Add-Pass "Firewall ($n): default inbound action = Block (implicit deny)" }
+        else { Add-Fail "Firewall ($n): default inbound action = $($p.DefaultInboundAction)" "Set-NetFirewallProfile -Profile $n -DefaultInboundAction Block" }
+        if ("$($p.LogBlocked)" -eq 'True' -and [int]$p.LogMaxSizeKilobytes -ge 16384) { Add-Pass "Firewall ($n): dropped packets logged, max log size $($p.LogMaxSizeKilobytes) KB" }
+        else { Add-Warn "Firewall ($n): logging of dropped packets off or log size < 16384 KB (LogBlocked=$($p.LogBlocked), size=$($p.LogMaxSizeKilobytes))" "Set-NetFirewallProfile -Profile $n -LogBlocked True -LogMaxSizeKilobytes 16384" }
+    }
+}
+
+# SMB
+$smb = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+if ($smb) {
+    if (-not $smb.EnableSMB1Protocol) { Add-Pass 'SMBv1 server protocol is disabled' }
+    else { Add-Fail 'SMBv1 server protocol is ENABLED' 'Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force' }
+    if ($smb.EnableSMB2Protocol) { Add-Pass 'SMBv2/v3 is enabled' } else { Add-Fail 'SMBv2/v3 is disabled' 'Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force' }
+    Add-Info "SMB encryption (EncryptData) = $($smb.EncryptData); RejectUnencryptedAccess = $($smb.RejectUnencryptedAccess)"
+} else { Add-Warn 'Get-SmbServerConfiguration unavailable - SMB configuration could not be verified' }
+
+$shares = @(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Special })
+if ($shares.Count -gt 0) {
+    Add-Info "Non-administrative SMB shares: $(($shares | ForEach-Object { $_.Name }) -join ', ')"
+    foreach ($sh in $shares) {
+        foreach ($ace in @(Get-SmbShareAccess -Name $sh.Name -ErrorAction SilentlyContinue)) {
+            if ("$($ace.AccessControlType)" -eq 'Allow' -and "$($ace.AccessRight)" -in 'Full', 'Change' -and (Get-SidString $ace.AccountName) -in 'S-1-1-0', 'S-1-5-7') {
+                Add-Warn "Share '$($sh.Name)' grants $($ace.AccessRight) to $($ace.AccountName)" "Revoke-SmbShareAccess -Name '$($sh.Name)' -AccountName '$($ace.AccountName)' -Force"
             }
         }
     }
-} else {
-    Add-Warn 'auditpol.exe не найден - политика аудита не проверена'
+} else { Add-Pass 'No non-administrative SMB shares exposed' }
+
+# NetBIOS over TCP/IP
+foreach ($nic in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE')) {
+    if ($nic.TcpipNetbiosOptions -eq 2) { Add-Pass "NetBIOS over TCP/IP disabled on '$($nic.Description)'" }
+    else { Add-Warn "NetBIOS over TCP/IP not disabled on '$($nic.Description)' (option=$($nic.TcpipNetbiosOptions))" "Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'Index=$($nic.Index)' | Invoke-CimMethod -MethodName SetTcpipNetbios -Arguments @{TcpipNetbiosOptions=[uint32]2}" }
 }
 
-# Командная строка процессов в событии 4688 + PowerShell logging (критично для SIEM / Wazuh)
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' `
-    -Name 'ProcessCreationIncludeCmdLine_Enabled' -Expected 1 -Severity WARN `
-    -Desc 'Включение командной строки в события создания процесса (4688)'
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' `
-    -Name 'EnableScriptBlockLogging' -Expected 1 -Severity WARN -Desc 'PowerShell Script Block Logging (CIS 18.10.87.1)'
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' `
-    -Name 'EnableModuleLogging' -Expected 1 -Severity WARN -Desc 'PowerShell Module Logging'
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' `
-    -Name 'EnableTranscripting' -Expected 1 -Severity WARN -Desc 'PowerShell Transcription'
-
-# Агент SIEM и Sysmon
-$wz = Get-Service -Name 'WazuhSvc', 'OssecSvc' | Select-Object -First 1
-if ($wz) {
-    if ($wz.Status -eq 'Running') { Add-Pass "Агент Wazuh ($($wz.Name)) запущен" }
-    else { Add-Fail "Агент Wazuh ($($wz.Name)) не запущен (состояние: $($wz.Status))" "Start-Service $($wz.Name)" }
-    if ($wz.StartType -ne 'Automatic') {
-        Add-Warn "Агент Wazuh: тип запуска $($wz.StartType) (ожидается Automatic)" "Set-Service $($wz.Name) -StartupType Automatic"
-    }
-} else {
-    Add-Warn 'Агент Wazuh (WazuhSvc) не найден - события не передаются в SIEM' 'Установить wazuh-agent и зарегистрировать на менеджере кластера'
-}
-$sm = Get-Service -Name 'Sysmon64', 'Sysmon' | Select-Object -First 1
-if ($sm -and $sm.Status -eq 'Running') { Add-Pass "Sysmon ($($sm.Name)) запущен" }
-elseif ($sm) { Add-Warn "Sysmon ($($sm.Name)) установлен, но не запущен" "Start-Service $($sm.Name)" }
-else { Add-Warn 'Sysmon не установлен (рекомендуется для детектирования: process/network/registry events)' 'sysmon64 -accepteula -i <sysmonconfig.xml>' }
-
-# ============================================================================
-# 3. СЕТЬ, ОТКРЫТЫЕ ПОРТЫ, МЕЖСЕТЕВОЙ ЭКРАН, СЕТЕВОЙ HARDENING
-# ============================================================================
-
-Start-Section '3. СЕТЬ, ОТКРЫТЫЕ ПОРТЫ, МЕЖСЕТЕВОЙ ЭКРАН И СЕТЕВОЙ HARDENING'
-
-if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-    Add-Info "Сбор данных через Get-NetTCPConnection / Get-NetUDPEndpoint"
-    $procMap = @{}
-    Get-Process | ForEach-Object { $procMap[[int]$_.Id] = $_.ProcessName }
-    $tcp = @(Get-NetTCPConnection -State Listen | Sort-Object LocalPort)
-    foreach ($c in $tcp) {
-        Write-Log ('         tcp LISTEN {0}:{1}  pid={2} ({3})' -f $c.LocalAddress, $c.LocalPort, $c.OwningProcess, $procMap[[int]$c.OwningProcess])
-    }
-    $udp = @(Get-NetUDPEndpoint | Sort-Object LocalPort)
-    foreach ($c in $udp) {
-        Write-Log ('         udp        {0}:{1}  pid={2} ({3})' -f $c.LocalAddress, $c.LocalPort, $c.OwningProcess, $procMap[[int]$c.OwningProcess])
-    }
-    Add-Info "Всего слушающих сокетов: TCP LISTEN=$($tcp.Count), UDP=$($udp.Count)"
-    $wild = @($tcp | Where-Object { $_.LocalAddress -in @('0.0.0.0', '::') } |
-              Select-Object -ExpandProperty LocalPort -Unique)
-    if ($wild.Count -gt 0) {
-        Add-Warn "Обнаружено $($wild.Count) уникальных TCP-портов, слушающих на всех интерфейсах (0.0.0.0/::)" `
-                 'Ограничить доступ к управляющим портам (RDP 3389, WinRM 5985/5986, SMB 445, exporters 9100/9182) через Windows Firewall scope (RemoteAddress) либо bind на конкретный интерфейс'
-    }
-    $risky = @{ 21 = 'FTP'; 23 = 'Telnet'; 69 = 'TFTP'; 5900 = 'VNC' }
-    $riskyHit = @($tcp | Where-Object { $risky.ContainsKey([int]$_.LocalPort) } |
-                  ForEach-Object { '{0}/{1}' -f $_.LocalPort, $risky[[int]$_.LocalPort] } | Select-Object -Unique)
-    if ($riskyHit.Count -gt 0) {
-        Add-Warn "Слушаются небезопасные/устаревшие сервисы: $($riskyHit -join ', ')" 'Отключить службу и закрыть порт в firewall; использовать SFTP/RDP с NLA/SSH'
-    }
-} else {
-    Add-Warn 'Get-NetTCPConnection недоступен - список портов не собран' 'Проверить вручную: netstat -ano | findstr LISTENING'
-}
-
-# Windows Defender Firewall. Enabled/DefaultInboundAction = NotConfigured - штатные
-# безопасные значения по умолчанию (inbound Block), поэтому оцениваем только явный Allow / Off.
-$fwOk = $false
-$mps = Get-Service -Name MpsSvc
-if ($mps -and $mps.Status -eq 'Running' -and (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue)) {
-    $fwOk = $true
-    Add-Pass 'Служба Windows Defender Firewall (MpsSvc) запущена'
-    foreach ($p in @(Get-NetFirewallProfile)) {
-        $pn = "$($p.Name)"; $en = "$($p.Enabled)"; $inb = "$($p.DefaultInboundAction)"
-        if ($en -eq 'False') {
-            Add-Fail "Профиль firewall '${pn}' ОТКЛЮЧЁН" "Set-NetFirewallProfile -Profile ${pn} -Enabled True"
-        } else { Add-Pass "Профиль firewall '${pn}' включён (Enabled=${en})" }
-        if ($inb -eq 'Allow') {
-            Add-Fail "Профиль '${pn}': DefaultInboundAction=Allow - весь непереченный входящий трафик разрешён" `
-                     "Set-NetFirewallProfile -Profile ${pn} -DefaultInboundAction Block"
-        } else { Add-Pass "Профиль '${pn}': DefaultInboundAction=${inb} (implicit deny, безопасно)" }
-        if ("$($p.LogBlocked)" -eq 'True') { Add-Pass "Профиль '${pn}': логирование заблокированных пакетов включено" }
-        else {
-            Add-Warn "Профиль '${pn}': логирование заблокированных пакетов не включено (CIS 9.x.6)" `
-                     "Set-NetFirewallProfile -Profile ${pn} -LogBlocked True -LogMaxSizeKilobytes 16384"
-        }
-    }
-    $allowCnt = @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -PolicyStore ActiveStore).Count
-    Add-Info "Включённых входящих allow-правил в активной политике: ${allowCnt}"
-}
-if (-not $fwOk) {
-    Add-Fail 'Windows Defender Firewall не активен (служба MpsSvc остановлена или NetSecurity недоступен)' `
-             'Set-Service MpsSvc -StartupType Automatic; Start-Service MpsSvc; Set-NetFirewallProfile -All -Enabled True'
-}
-
-# Аналог блока sysctl: сетевые параметры ОС
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' `
-    -Expected 0 -Severity WARN -Desc 'Отключение LLMNR (CIS 18.6.4.x)'
-
-$nics = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE')
-$nbBad = @($nics | Where-Object { $_.TcpipNetbiosOptions -ne 2 } | ForEach-Object { $_.Description })
-if ($nics.Count -eq 0) { Add-Info 'Активных IP-адаптеров не найдено - проверка NetBIOS пропущена' }
-elseif ($nbBad.Count -eq 0) { Add-Pass 'NetBIOS over TCP/IP отключён на всех активных адаптерах' }
-else {
-    Add-Warn "NetBIOS over TCP/IP не отключён на адаптерах: $($nbBad -join '; ')" `
-             'Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=TRUE" | Invoke-CimMethod -MethodName SetTcpipNetbios -Arguments @{TcpipNetbiosOptions=[uint32]2}'
-}
-
-$smb = Get-SmbServerConfiguration
-if ($smb) {
-    if (-not $smb.EnableSMB1Protocol) { Add-Pass 'SMBv1 (сервер) отключён' }
-    else { Add-Fail 'SMBv1 (сервер) ВКЛЮЧЁН' 'Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force' }
-    if ($smb.RequireSecuritySignature) { Add-Pass 'SMB-сервер: подпись пакетов обязательна (RequireSecuritySignature)' }
-    else { Add-Fail 'SMB-сервер: подпись пакетов не является обязательной (CIS 2.3.9.2)' 'Set-SmbServerConfiguration -RequireSecuritySignature $true -Force' }
-} else { Add-Info 'Get-SmbServerConfiguration недоступен (служба LanmanServer остановлена?) - проверки SMB-сервера пропущены' }
-Test-RegSetting -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' -Name 'RequireSecuritySignature' `
-    -Expected 1 -Severity WARN -Desc 'SMB-клиент: обязательная подпись (CIS 2.3.8.1)'
-
-if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
-    $shares = @(Get-SmbShare | Where-Object { -not $_.Special })
-    if ($shares.Count -eq 0) { Add-Pass 'Пользовательских SMB-шар нет (только административные)' }
-    foreach ($sh in $shares) {
-        $everyone = @(Get-SmbShareAccess -Name $sh.Name | Where-Object {
-            $_.AccessRight -in @('Full', 'Change') -and $_.AccountName -match '^(Everyone|Все)$' })
-        if ($everyone.Count -gt 0) {
-            Add-Warn "SMB-шара '$($sh.Name)' ($($sh.Path)): Everyone имеет Full/Change" "Revoke-SmbShareAccess -Name '$($sh.Name)' -AccountName Everyone -Force"
-        } else { Add-Info "SMB-шара '$($sh.Name)' ($($sh.Path)): Everyone не имеет Full/Change" }
-    }
-}
+# Remote Desktop
+$TsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+if ((Get-RegValue $TsKey 'fDenyTSConnections') -eq 0) {
+    Add-Info "Remote Desktop is ENABLED (port $(Get-RegValue "$TsKey\WinStations\RDP-Tcp" 'PortNumber'))"
+    Test-RegTable @(
+        @{ Path = "$TsKey\WinStations\RDP-Tcp"; Name = 'UserAuthentication'; Value = 1; Desc = 'RDP requires Network Level Authentication (NLA)' },
+        @{ Path = "$TsKey\WinStations\RDP-Tcp"; Name = 'SecurityLayer';      Value = 2; Desc = 'RDP security layer = TLS'; Sev = 'WARN' },
+        @{ Path = "$TsKey\WinStations\RDP-Tcp"; Name = 'MinEncryptionLevel'; Value = 3; Desc = 'RDP encryption level = High'; Sev = 'WARN' }
+    )
+} else { Add-Pass 'Remote Desktop is disabled' }
 
 # WinRM
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service' -Name 'AllowBasic' `
-    -Expected 0 -DefaultIfMissing 0 -Severity WARN -Desc 'WinRM-сервис: Basic-аутентификация отключена (CIS 18.10.89.2.3)'
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service' -Name 'AllowUnencryptedTraffic' `
-    -Expected 0 -DefaultIfMissing 0 -Severity FAIL -Desc 'WinRM-сервис: незашифрованный трафик запрещён (CIS 18.10.89.2.4)'
+$wr = Get-Service -Name WinRM
+if ($wr -and $wr.Status -eq 'Running') {
+    Add-Info 'WinRM service is running'
+    $basic = try { (Get-Item WSMan:\localhost\Service\Auth\Basic -ErrorAction Stop).Value } catch { $null }
+    $unenc = try { (Get-Item WSMan:\localhost\Service\AllowUnencrypted -ErrorAction Stop).Value } catch { $null }
+    if ($null -ne $basic) { if ("$basic" -eq 'false') { Add-Pass 'WinRM service: Basic authentication disabled' } else { Add-Fail 'WinRM service: Basic authentication ENABLED' 'Set-Item WSMan:\localhost\Service\Auth\Basic -Value $false' } }
+    if ($null -eq $basic -and $null -eq $unenc) { Add-Warn 'WinRM is running but WSMan configuration could not be read' 'Run: winrm get winrm/config/service' }
+    if ($null -ne $unenc) { if ("$unenc" -eq 'false') { Add-Pass 'WinRM service: unencrypted traffic not allowed' } else { Add-Fail 'WinRM service: AllowUnencrypted = true' 'Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $false' } }
+} else { Add-Pass 'WinRM service is not running' }
 
-# RDP
-$rdpDeny = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
-if ($rdpDeny -eq 1) { Add-Pass 'RDP отключён (fDenyTSConnections=1)' }
-else {
-    Add-Info 'RDP включён - проверяются параметры безопасности сессии'
-    $rdp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-    Test-RegSetting -Path $rdp -Name 'UserAuthentication' -Expected 1 -DefaultIfMissing 1 -Severity FAIL -Desc 'RDP: Network Level Authentication (NLA)'
-    Test-RegSetting -Path $rdp -Name 'SecurityLayer'      -Expected 2 -Op ge -DefaultIfMissing 1 -Severity WARN -Desc 'RDP: SecurityLayer (2 = TLS)'
-    Test-RegSetting -Path $rdp -Name 'MinEncryptionLevel' -Expected 3 -Op ge -DefaultIfMissing 2 -Severity WARN -Desc 'RDP: минимальный уровень шифрования (3 = High)'
+# SCHANNEL protocols (server side)
+foreach ($proto in 'SSL 2.0', 'SSL 3.0', 'TLS 1.0', 'TLS 1.1') {
+    $base = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$proto\Server"
+    $en = Get-RegValue $base 'Enabled'; $dis = Get-RegValue $base 'DisabledByDefault'
+    $legacy = $proto -like 'SSL*'
+    $fix = "$(New-RegFix $base 'Enabled' 0); $(New-RegFix $base 'DisabledByDefault' 1)"
+    if ($null -ne $en -and [int64]$en -eq 0) { Add-Pass "$proto (server) is disabled" }
+    elseif ($null -ne $en) { Add-Result $(if ($legacy) { 'FAIL' } else { 'WARN' }) "$proto (server) is explicitly ENABLED (Enabled=$en)" $fix }
+    elseif ($dis -eq 1) { Add-Pass "$proto (server) is disabled by default (DisabledByDefault=1)" }
+    elseif ($legacy)   { Add-Pass "$proto (server) not enabled (OS default: disabled)" }
+    else               { Add-Warn "$proto (server) is not explicitly disabled (OS default depends on build)" $fix }
 }
 
+Test-RegTable @(
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters';  Name = 'DisableIPSourceRouting'; Value = 2; Desc = 'IPv4 source routing disabled' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'; Name = 'DisableIPSourceRouting'; Value = 2; Desc = 'IPv6 source routing disabled' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters';  Name = 'EnableICMPRedirect';     Value = 0; Desc = 'ICMP redirects cannot override OSPF routes' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netbt\Parameters';  Name = 'NoNameReleaseOnDemand';  Value = 1; Desc = 'NetBIOS ignores name-release requests'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient';    Name = 'EnableMulticast';        Value = 0; Desc = 'LLMNR (multicast name resolution) disabled' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'; Name = 'EnableMDNS';          Value = 0; Desc = 'mDNS disabled'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters';      Name = 'RequireSecuritySignature'; Value = 1; Desc = 'SMB server: digitally sign communications (always)' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters';      Name = 'RestrictNullSessAccess';   Value = 1; Desc = 'Restrict anonymous access to named pipes and shares'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'; Name = 'RequireSecuritySignature'; Value = 1; Desc = 'SMB client: digitally sign communications (always)' },
+    @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation';          Name = 'AllowInsecureGuestAuth';   Value = 0; Desc = 'SMB insecure guest logons disabled'; Default = $IsServer },
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319';              Name = 'SchUseStrongCrypto'; Value = 1; Desc = '.NET 4 strong crypto (64-bit)'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319';  Name = 'SchUseStrongCrypto'; Value = 1; Desc = '.NET 4 strong crypto (32-bit)'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'; Name = 'RestrictDriverInstallationToAdministrators'; Value = 1; Desc = 'Point and Print: driver installation restricted to administrators (PrintNightmare)'; Default = $true }
+)
+
 # ============================================================================
-# 4. ПОЛЬЗОВАТЕЛИ, ПАРОЛЬНАЯ ПОЛИТИКА, ПРАВА ДОСТУПА И ACL
+# 4. USERS, PERMISSIONS, LOCAL POLICY, AND REMOTE ACCESS
 # ============================================================================
 
-Start-Section '4. ПОЛЬЗОВАТЕЛИ, ПАРОЛЬНАЯ ПОЛИТИКА, ПРАВА ДОСТУПА И ACL'
+Write-Section '4. USER ACCOUNTS, PASSWORD POLICY, PERMISSIONS, AND REMOTE ACCESS'
 
-if ((Get-Command Get-LocalUser -ErrorAction SilentlyContinue) -and -not $IsDC) {
-    $users = @(Get-LocalUser)
-    if ($users.Count -gt 0) {
-        $guest = $users | Where-Object { $_.SID.Value -like '*-501' } | Select-Object -First 1
-        if ($guest -and $guest.Enabled) { Add-Fail "Учётная запись Guest ВКЛЮЧЕНА ($($guest.Name))" "Disable-LocalUser -SID $($guest.SID.Value)" }
-        else { Add-Pass 'Учётная запись Guest отключена' }
-
-        $adm = $users | Where-Object { $_.SID.Value -like '*-500' } | Select-Object -First 1
+if (-not $IsDC) {
+    $users = @(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=TRUE')
+    if ($users.Count -eq 0) { Add-Warn 'Local account list could not be read (Win32_UserAccount)' }
+    else {
+        $adm = $users | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1
+        $gst = $users | Where-Object { $_.SID -like '*-501' } | Select-Object -First 1
         if ($adm) {
-            if ($adm.Name -in @('Administrator', 'Администратор')) {
-                Add-Warn "Встроенная учётная запись Administrator (RID 500) не переименована (Enabled=$($adm.Enabled)) (CIS 2.3.1.5)" `
-                         "Rename-LocalUser -SID $($adm.SID.Value) -NewName '<новое_имя>'"
-            } else { Add-Pass "Встроенная учётная запись RID 500 переименована ($($adm.Name))" }
+            if ($adm.Disabled) { Add-Pass "Built-in Administrator account ($($adm.Name)) is disabled" }
+            else { Add-Result $(if ($IsServer) { 'WARN' } else { 'FAIL' }) "Built-in Administrator account ($($adm.Name)) is ENABLED" "Disable-LocalUser -SID $($adm.SID)   # or keep it disabled and use named admin accounts" }
+            if ($adm.Name -ieq 'Administrator') { Add-Warn "Built-in Administrator account (RID 500) has not been renamed" "Rename-LocalUser -Name 'Administrator' -NewName '<new_name>'" }
+            else { Add-Pass "Built-in Administrator account (RID 500) renamed to '$($adm.Name)'" }
         }
-
-        $noPw = @($users | Where-Object { $_.Enabled -and -not $_.PasswordRequired } | ForEach-Object { $_.Name })
-        if ($noPw.Count -eq 0) { Add-Pass 'Включённых учётных записей без обязательного пароля не обнаружено' }
-        else {
-            Add-Fail "Включённые учётные записи БЕЗ обязательного пароля: $($noPw -join ', ')" `
-                     "Set-LocalUser -Name '<пользователь>' -PasswordNotRequired `$false; затем задать пароль либо Disable-LocalUser"
+        if ($gst) {
+            if ($gst.Disabled) { Add-Pass 'Guest account is disabled' } else { Add-Fail 'Guest account is ENABLED' "Disable-LocalUser -SID $($gst.SID)" }
         }
-
-        $neverExp = @($users | Where-Object { $_.Enabled -and $_.PasswordExpires -eq $null } | ForEach-Object { $_.Name })
-        if ($neverExp.Count -gt 0) {
-            Add-Warn "Включённые учётные записи с паролем без срока действия: $($neverExp -join ', ')" `
-                     'Для сервисных учётных записей использовать gMSA / vault; для людей - политику смены пароля либо MFA'
-        }
-        Add-Info "Локальных учётных записей: $($users.Count), включённых: $(@($users | Where-Object { $_.Enabled }).Count)"
+        $enabled = @($users | Where-Object { -not $_.Disabled })
+        Add-Info "Enabled local accounts: $($enabled.Count) ($(($enabled | ForEach-Object { $_.Name }) -join ', '))"
+        $nopw = @($enabled | Where-Object { -not $_.PasswordRequired })
+        if ($nopw.Count -eq 0) { Add-Pass 'No enabled local accounts with "password not required"' }
+        else { Add-Fail "Enabled accounts that do NOT require a password: $(($nopw | ForEach-Object { $_.Name }) -join ', ')" "net user <user> /passwordreq:yes   # or: Set-LocalUser -Name '<user>' -Password (Read-Host -AsSecureString)" }
+        $noexp = @($enabled | Where-Object { -not $_.PasswordExpires })
+        if ($noexp.Count -eq 0) { Add-Pass 'No enabled local accounts with non-expiring passwords' }
+        else { Add-Warn "Enabled accounts with password set to never expire: $(($noexp | ForEach-Object { $_.Name }) -join ', ')" "Set-LocalUser -Name '<user>' -PasswordNeverExpires `$false   # service accounts: use gMSA/LAPS instead" }
     }
+} else { Add-Info 'Domain Controller: local SAM account checks skipped (domain accounts must be audited via Active Directory)' }
 
-    $admins = @(Get-LocalGroupMember -SID 'S-1-5-32-544')
-    if ($admins.Count -gt 0) {
-        Add-Info "Члены локальной группы Administrators ($($admins.Count)): $(($admins | ForEach-Object { $_.Name }) -join ', ')"
-        if ($admins.Count -gt 5) { Add-Warn "В локальной группе Administrators $($admins.Count) участников - проверить необходимость (least privilege)" }
+# Local Administrators group membership
+function Get-LocalAdminMembers {
+    try { return @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.Name }) } catch { }
+    try {
+        $grp = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+        $lines = @(& net.exe localgroup $grp 2>$null)
+        $idx = 0
+        for ($k = 0; $k -lt $lines.Count; $k++) { if ($lines[$k] -match '^-{5,}') { $idx = $k + 1; break } }
+        return @($lines[$idx..($lines.Count - 1)] | Where-Object { $_.Trim() -and $_ -notmatch 'completed successfully|command completed' } | ForEach-Object { $_.Trim() })
+    } catch { return @() }
+}
+$admins = Get-LocalAdminMembers
+if ($admins.Count -gt 0) {
+    Add-Info "Administrators group members ($($admins.Count)): $($admins -join ', ')"
+    if ($admins.Count -gt 4) { Add-Warn "Administrators group has $($admins.Count) members (more than 4)" 'Review membership; apply least privilege / LAPS / tiered admin model' }
+    else { Add-Pass "Administrators group membership is small ($($admins.Count))" }
+} else { Add-Warn 'Administrators group membership could not be enumerated' }
+
+# Effective local security policy via secedit (temp export, deleted afterwards)
+$SecPol = @{}
+$tmpInf = Join-Path $env:TEMP ('secpol_{0}.inf' -f [guid]::NewGuid().ToString('N'))
+try {
+    & secedit.exe /export /cfg $tmpInf /areas SECURITYPOLICY USER_RIGHTS /quiet | Out-Null
+    if (Test-Path -LiteralPath $tmpInf) {
+        Get-Content -LiteralPath $tmpInf -Encoding Unicode | ForEach-Object {
+            if ($_ -match '^\s*([^=\[;]+?)\s*=\s*(.*?)\s*$') { $SecPol[$Matches[1]] = $Matches[2] }
+        }
     }
-} elseif (-not $IsDC) {
-    Add-Warn 'Модуль Microsoft.PowerShell.LocalAccounts недоступен - проверка локальных пользователей пропущена'
+} catch { } finally { Remove-Item -LiteralPath $tmpInf -Force -ErrorAction SilentlyContinue }
+
+function Test-SecPol {
+    param([string]$Key, [string]$Op, $Value, [string]$Desc, [string]$Sev = 'FAIL', [string]$Fix = '')
+    $raw = $SecPol[$Key]
+    if ($null -eq $raw -or $raw -eq '') { Add-Result $Sev "$Desc : $Key not present in effective policy" $Fix; return }
+    $expTxt = if ($Op -eq 'range') { "$($Value[0])-$($Value[1])" } elseif ($Op -eq 'le') { "<= $Value" } elseif ($Op -eq 'ge') { ">= $Value" } elseif ($Op -eq 'gem1') { ">= $Value or -1" } else { "$Value" }
+    if (Test-Cmp $raw $Op $Value) { Add-Pass "$Desc : $raw (expected: $expTxt)" } else { Add-Result $Sev "$Desc : $raw (expected: $expTxt)" $Fix }
 }
 
-# Парольная политика и права (secedit, ключи не локализуются)
-$sec = Get-SecPolicy
-if ($sec.Count -eq 0) {
-    Add-Warn 'secedit не вернул политику безопасности - парольная политика не проверена' 'Проверить вручную: secedit /export /cfg C:\secpol.inf'
+if ($SecPol.Count -eq 0) {
+    Add-Warn 'secedit export failed - password/lockout policy and user rights could not be verified' 'Run: secedit /export /cfg C:\Temp\secpol.inf'
 } else {
-    $n = { param($k) if ($sec.ContainsKey($k) -and $sec[$k] -match '^-?\d+$') { [int64]$sec[$k] } else { $null } }
-    $v = & $n 'MinimumPasswordLength'
-    if ($null -eq $v) { Add-Warn 'MinimumPasswordLength не определён' }
-    elseif ($v -ge 14) { Add-Pass "Минимальная длина пароля: ${v} (>= 14)" }
-    elseif ($v -ge 8)  { Add-Warn "Минимальная длина пароля: ${v} (CIS L1: >= 14)" 'net accounts /minpwlen:14 (либо GPO: Computer Configuration > Windows Settings > Security Settings > Account Policies)' }
-    else               { Add-Fail "Минимальная длина пароля: ${v} (слишком мала)" 'net accounts /minpwlen:14' }
+    $gpoNote = '(or via GPO: Computer Configuration > Windows Settings > Security Settings > Account Policies)'
+    Test-SecPol 'MinimumPasswordLength' 'ge' 14 'Minimum password length'                    'FAIL' "net accounts /minpwlen:14 $gpoNote"
+    Test-SecPol 'PasswordComplexity'    'eq' 1  'Password must meet complexity requirements' 'FAIL' "GPO: Password Policy > Password must meet complexity requirements = Enabled"
+    Test-SecPol 'MaximumPasswordAge'    'range' @(1, 365) 'Maximum password age (days)'     'WARN' "net accounts /maxpwage:365 $gpoNote"
+    Test-SecPol 'MinimumPasswordAge'    'ge' 1  'Minimum password age (days)'               'WARN' "net accounts /minpwage:1 $gpoNote"
+    Test-SecPol 'PasswordHistorySize'   'ge' 24 'Password history remembered'               'WARN' "net accounts /uniquepw:24 $gpoNote"
+    Test-SecPol 'ClearTextPassword'     'eq' 0  'Store passwords using reversible encryption (must be 0)' 'FAIL' "GPO: Password Policy > Store passwords using reversible encryption = Disabled"
+    Test-SecPol 'LockoutBadCount'       'range' @(1, 5) 'Account lockout threshold'         'FAIL' "net accounts /lockoutthreshold:5 $gpoNote"
+    Test-SecPol 'ResetLockoutCount'     'ge' 15 'Reset account lockout counter after (min)' 'WARN' "net accounts /lockoutwindow:15 $gpoNote"
+    Test-SecPol 'LockoutDuration'       'gem1' 15 'Account lockout duration (min; -1 = admin unlock)' 'WARN' "net accounts /lockoutduration:15 $gpoNote"
+    Test-SecPol 'LSAAnonymousNameLookup' 'eq' 0 'Allow anonymous SID/name translation (must be 0)' 'FAIL' 'GPO: Security Options > Network access: Allow anonymous SID/Name translation = Disabled'
 
-    $v = & $n 'PasswordComplexity'
-    if ($v -eq 1) { Add-Pass 'Требования сложности пароля включены' }
-    else { Add-Fail "Требования сложности пароля не включены (PasswordComplexity=${v})" 'GPO: Password must meet complexity requirements = Enabled' }
-
-    $v = & $n 'MaximumPasswordAge'
-    if ($null -ne $v -and $v -ge 1 -and $v -le 365) { Add-Pass "Максимальный срок действия пароля: ${v} дн." }
-    else { Add-Warn "Максимальный срок действия пароля: ${v} (CIS: 1..365 дней; -1/0 = бессрочный)" 'net accounts /maxpwage:365' }
-
-    $v = & $n 'MinimumPasswordAge'
-    if ($null -ne $v -and $v -ge 1) { Add-Pass "Минимальный срок действия пароля: ${v} дн." }
-    else { Add-Warn "Минимальный срок действия пароля: ${v} (рекомендуется >= 1)" 'net accounts /minpwage:1' }
-
-    $v = & $n 'PasswordHistorySize'
-    if ($null -ne $v -and $v -ge 24) { Add-Pass "История паролей: ${v} (>= 24)" }
-    else { Add-Warn "История паролей: ${v} (CIS: >= 24)" 'net accounts /uniquepw:24' }
-
-    $v = & $n 'ClearTextPassword'
-    if ($v -eq 0) { Add-Pass 'Хранение паролей в обратимом виде отключено' }
-    else { Add-Fail "Хранение паролей в обратимом шифровании: ClearTextPassword=${v}" 'GPO: Store passwords using reversible encryption = Disabled' }
-
-    $lb = & $n 'LockoutBadCount'
-    if ($lb -ge 1 -and $lb -le 5) { Add-Pass "Порог блокировки учётной записи: ${lb} (<= 5)" }
-    elseif ($lb -eq 0) { Add-Fail 'Блокировка учётных записей отключена (LockoutBadCount=0)' 'net accounts /lockoutthreshold:5' }
-    else { Add-Warn "Порог блокировки: ${lb} (CIS: 1..5)" 'net accounts /lockoutthreshold:5' }
-    if ($lb -ge 1) {
-        $d = & $n 'LockoutDuration'
-        if ($d -eq -1 -or $d -ge 15) { Add-Pass "Длительность блокировки: ${d} мин. (-1 = до разблокировки админом)" }
-        else { Add-Warn "Длительность блокировки: ${d} мин. (CIS: >= 15)" 'net accounts /lockoutduration:15' }
-        $d = & $n 'ResetLockoutCount'
-        if ($d -ge 15) { Add-Pass "Сброс счётчика блокировки через ${d} мин. (>= 15)" }
-        else { Add-Warn "Сброс счётчика блокировки через ${d} мин. (CIS: >= 15)" 'net accounts /lockoutwindow:15' }
-    }
-
-    if ($sec.ContainsKey('SeDebugPrivilege')) {
-        if ($sec['SeDebugPrivilege'] -eq '*S-1-5-32-544') { Add-Pass 'SeDebugPrivilege выдана только Administrators' }
-        else { Add-Warn "SeDebugPrivilege выдана: $($sec['SeDebugPrivilege']) (CIS 2.2.x: только Administrators)" 'GPO: Debug programs = Administrators' }
-    }
+    function Get-Right { param([string]$Key) $v = $SecPol[$Key]; if ($v) { @($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
+    $dbg = @(Get-Right 'SeDebugPrivilege')
+    if (($dbg | Where-Object { $_ -ne '*S-1-5-32-544' }).Count -eq 0) { Add-Pass 'SeDebugPrivilege (debug programs) limited to Administrators' }
+    else { Add-Fail "SeDebugPrivilege granted to: $($dbg -join ', ')" 'GPO: User Rights Assignment > Debug programs = Administrators' }
+    $tcb = @(Get-Right 'SeTcbPrivilege')
+    if ($tcb.Count -eq 0) { Add-Pass 'SeTcbPrivilege (act as part of the OS) granted to no one' } else { Add-Fail "SeTcbPrivilege granted to: $($tcb -join ', ')" 'GPO: User Rights Assignment > Act as part of the operating system = (empty)' }
+    $net = @(Get-Right 'SeNetworkLogonRight')
+    if (($net | Where-Object { $_ -in '*S-1-1-0', '*S-1-5-32-546' }).Count -eq 0) { Add-Pass 'Network logon right does not include Everyone/Guests' }
+    else { Add-Fail "Network logon right includes Everyone/Guests: $($net -join ', ')" 'GPO: User Rights Assignment > Access this computer from the network = Administrators, Authenticated Users' }
+    $rdp = @(Get-Right 'SeRemoteInteractiveLogonRight')
+    if (($rdp | Where-Object { $_ -in '*S-1-1-0', '*S-1-5-32-546', '*S-1-5-32-545', '*S-1-5-11' }).Count -eq 0) { Add-Pass 'RDP logon right limited to administrative/RDP groups' }
+    else { Add-Fail "RDP logon right too broad: $($rdp -join ', ')" 'GPO: User Rights Assignment > Allow log on through Remote Desktop Services = Administrators, Remote Desktop Users' }
+    $deny = @(Get-Right 'SeDenyNetworkLogonRight')
+    if ($deny -contains '*S-1-5-32-546') { Add-Pass 'Guests are denied network logon' } else { Add-Warn 'Guests are not in "Deny access to this computer from the network"' 'GPO: User Rights Assignment > Deny access to this computer from the network = Guests' }
 }
 
-# Права на критичные объекты ФС (аналог check_perm)
+# Security options (registry)
+$PolSys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+$Lsa    = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+Test-RegTable @(
+    @{ Path = $PolSys; Name = 'EnableLUA';                   Value = 1; Desc = 'UAC: Run all administrators in Admin Approval Mode'; Default = $true },
+    @{ Path = $PolSys; Name = 'ConsentPromptBehaviorAdmin';  Value = 2; Desc = 'UAC: elevation prompt for admins = consent on secure desktop'; Sev = 'WARN' },
+    @{ Path = $PolSys; Name = 'ConsentPromptBehaviorUser';   Value = 0; Desc = 'UAC: elevation prompt for standard users = automatically deny'; Sev = 'WARN' },
+    @{ Path = $PolSys; Name = 'PromptOnSecureDesktop';       Value = 1; Desc = 'UAC: switch to the secure desktop when prompting'; Default = $true },
+    @{ Path = $PolSys; Name = 'FilterAdministratorToken';    Value = 1; Desc = 'UAC: Admin Approval Mode for built-in Administrator'; Sev = 'WARN' },
+    @{ Path = $PolSys; Name = 'LocalAccountTokenFilterPolicy'; Value = 0; Desc = 'Remote UAC token filtering for local accounts (pass-the-hash mitigation)'; Default = $true },
+    @{ Path = $PolSys; Name = 'DontDisplayLastUserName';     Value = 1; Desc = 'Interactive logon: do not display last signed-in user' },
+    @{ Path = $PolSys; Name = 'InactivityTimeoutSecs';       Value = @(1, 900); Op = 'range'; Desc = 'Interactive logon: machine inactivity limit (sec)' },
+    @{ Path = $Lsa; Name = 'LimitBlankPasswordUse';  Value = 1; Desc = 'Accounts: limit local blank-password use to console logon'; Default = $true },
+    @{ Path = $Lsa; Name = 'NoLMHash';               Value = 1; Desc = 'Do not store LAN Manager hash'; Default = $true },
+    @{ Path = $Lsa; Name = 'LmCompatibilityLevel';   Value = 5; Desc = 'LAN Manager authentication level = NTLMv2 only, refuse LM/NTLM' },
+    @{ Path = $Lsa; Name = 'RestrictAnonymousSAM';   Value = 1; Desc = 'Do not allow anonymous enumeration of SAM accounts'; Default = $true },
+    @{ Path = $Lsa; Name = 'RestrictAnonymous';      Value = 1; Desc = 'Do not allow anonymous enumeration of SAM accounts and shares'; Sev = 'WARN' },
+    @{ Path = $Lsa; Name = 'EveryoneIncludesAnonymous'; Value = 0; Desc = 'Let Everyone permissions apply to anonymous users (must be 0)'; Default = $true },
+    @{ Path = "$Lsa\MSV1_0"; Name = 'NTLMMinClientSec'; Value = 537395200; Desc = 'NTLM SSP client minimum session security (NTLMv2 + 128-bit)'; Sev = 'WARN' },
+    @{ Path = "$Lsa\MSV1_0"; Name = 'NTLMMinServerSec'; Value = 537395200; Desc = 'NTLM SSP server minimum session security (NTLMv2 + 128-bit)'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'RequireSignOrSeal';     Value = 1; Desc = 'Secure channel: always encrypt or sign'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'SealSecureChannel';     Value = 1; Desc = 'Secure channel: encrypt when possible'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'SignSecureChannel';     Value = 1; Desc = 'Secure channel: sign when possible'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'RequireStrongKey';      Value = 1; Desc = 'Secure channel: require strong (Windows 2000+) session key'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; Name = 'DisablePasswordChange'; Value = 0; Desc = 'Machine account password changes are not disabled'; Default = $true },
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'NoAutorun';          Value = 1;   Desc = 'AutoRun: default behaviour = do not execute autorun commands' },
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'NoDriveTypeAutoRun'; Value = 255; Desc = 'AutoRun disabled on all drives' },
+    @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'; Name = 'AlwaysInstallElevated'; Value = 0; Desc = 'Windows Installer: Always install with elevated privileges must be off'; Default = $true },
+    @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Name = 'AutoAdminLogon'; Value = 0; Desc = 'Automatic administrative logon disabled'; Default = $true }
+)
+if ($IsDomainJoined -and -not $IsServer) {
+    Test-RegTable @( @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Name = 'CachedLogonsCount'; Value = 4; Op = 'le'; Desc = 'Interactive logon: cached domain logons'; Sev = 'WARN' } )
+}
+
+if ($null -ne (Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'DefaultPassword')) {
+    Add-Fail 'Plaintext DefaultPassword is stored in Winlogon registry key (autologon credential)' "Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name DefaultPassword"
+} else { Add-Pass 'No plaintext DefaultPassword in Winlogon registry key' }
+
+$legalText = Get-RegValue $PolSys 'legalnoticetext'
+if ([string]::IsNullOrWhiteSpace([string]$legalText)) { Add-Warn 'Interactive logon: no legal notice (message text) configured' (New-RegFix $PolSys 'legalnoticetext' '"Authorized use only. Activity is monitored."' 'String') }
+else { Add-Pass 'Interactive logon: legal notice text is configured' }
+
+# Domain Controller specific
+if ($IsDC) {
+    $ntds = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+    Test-RegTable @(
+        @{ Path = $ntds; Name = 'LDAPServerIntegrity'; Value = 2; Desc = 'DC: LDAP server signing requirements = Require signing' },
+        @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'; Name = 'LdapEnforceChannelBinding'; Value = 1; Op = 'ge'; Desc = 'DC: LDAP channel binding token policy (1 = when supported, 2 = always)'; Sev = 'WARN' }
+    )
+    if ($null -ne (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'VulnerableChannelAllowList')) {
+        Add-Fail 'DC: Netlogon VulnerableChannelAllowList is configured (Zerologon exceptions)' "Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' -Name VulnerableChannelAllowList"
+    } else { Add-Pass 'DC: no Netlogon vulnerable-channel allow list configured' }
+}
+
+# File system ACL hygiene (equivalent of the permission checks in the Linux script)
+function Test-WeakAcl {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $weak = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')     # Everyone, Authenticated Users, BUILTIN\Users
+    $mask = [int][System.Security.AccessControl.FileSystemRights]'WriteData,AppendData,Delete,ChangePermissions,TakeOwnership'
+    $bad = @()
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        foreach ($r in $acl.Access) {
+            if ("$($r.AccessControlType)" -ne 'Allow') { continue }
+            if ($r.InheritanceFlags -ne 'None' -and "$($r.PropagationFlags)" -match 'InheritOnly') { continue }
+            $sid = Get-SidString $r.IdentityReference
+            if ($weak -notcontains $sid) { continue }
+            if (([int]$r.FileSystemRights -band $mask) -ne 0) { $bad += "$($r.IdentityReference):$($r.FileSystemRights)" }
+        }
+    } catch { return $null }
+    return , $bad
+}
 $sr = $env:SystemRoot
-foreach ($pth in @($sr, "$sr\System32", "$sr\System32\config", "$sr\System32\drivers\etc\hosts",
-                   "$sr\System32\winevt\Logs", $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-    if ($pth) { Test-WeakAcl $pth }
+foreach ($p in @($sr, "$sr\System32", "$sr\System32\config", "$sr\System32\config\SAM", "$sr\System32\drivers\etc\hosts", $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $p) { continue }
+    $r = Test-WeakAcl $p
+    if ($null -eq $r) { if (Test-Path -LiteralPath $p) { Add-Warn "${p}: ACL could not be read" }; continue }
+    if ($r.Count -eq 0) { Add-Pass "${p}: no write/modify rights for Everyone / Users / Authenticated Users" }
+    else { Add-Fail "${p}: weak ACL - $($r -join '; ')" "icacls `"$p`" /remove:g *S-1-1-0 *S-1-5-11 *S-1-5-32-545   # then re-grant Read & Execute where required" }
+}
+
+# OpenSSH server (if present) - same checks as the Linux sshd audit
+$sshdCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+if (Test-Path -LiteralPath $sshdCfg) {
+    Add-Info "OpenSSH server configuration found: $sshdCfg"
+    $cfgLines = @(Get-Content -LiteralPath $sshdCfg | Where-Object { $_ -match '^\s*[A-Za-z]' })
+    function Get-SshdOpt { param([string]$Key) $m = $cfgLines | Where-Object { $_ -match "^\s*$Key\s+(.+?)\s*$" } | Select-Object -First 1; if ($m) { ($m -replace "^\s*$Key\s+", '').Trim() } else { $null } }
+    $pa = Get-SshdOpt 'PasswordAuthentication'
+    if ($pa -eq 'no') { Add-Pass 'sshd: PasswordAuthentication no' } else { Add-Warn "sshd: PasswordAuthentication is not 'no' (current: $(if ($pa) { $pa } else { 'default yes' }))" "(Get-Content '$sshdCfg') -replace '^#?PasswordAuthentication.*','PasswordAuthentication no' | Set-Content '$sshdCfg'; Restart-Service sshd" }
+    $pe = Get-SshdOpt 'PermitEmptyPasswords'
+    if (-not $pe -or $pe -eq 'no') { Add-Pass 'sshd: PermitEmptyPasswords no / unset' } else { Add-Fail "sshd: PermitEmptyPasswords = $pe" 'Set PermitEmptyPasswords no in sshd_config' }
+    $mt = Get-SshdOpt 'MaxAuthTries'
+    if ($mt -and [int]$mt -le 4) { Add-Pass "sshd: MaxAuthTries = $mt (<=4)" } else { Add-Warn "sshd: MaxAuthTries = '$(if ($mt) { $mt } else { 'unset (default 6)' })'" 'Set MaxAuthTries 4 in sshd_config' }
+    $ci = Get-SshdOpt 'Ciphers'
+    if ($ci) { if ($ci -match '3des|arcfour|blowfish|cbc') { Add-Fail "sshd: weak ciphers enabled: $ci" 'Use Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com' } else { Add-Pass "sshd: ciphers defined explicitly, no weak algorithms: $ci" } }
 }
 
 # ============================================================================
-# 5. СЛУЖБЫ, ЦЕЛОСТНОСТЬ ФАЙЛОВ И ОБНОВЛЕНИЯ
+# 5. SERVICES, UPDATES, AND SYSTEM INTEGRITY
 # ============================================================================
 
-Start-Section '5. СЛУЖБЫ, ЦЕЛОСТНОСТЬ ФАЙЛОВ И ОБНОВЛЕНИЯ'
+Write-Section '5. SERVICES, UPDATES, OS LIFECYCLE, AND SYSTEM INTEGRITY'
 
-$insecure = @('TlntSvr', 'FTPSVC', 'SNMP', 'SNMPTRAP', 'RemoteRegistry', 'SSDPSRV', 'upnphost', 'Browser', 'simptcp', 'W3SVC')
-$foundInsecure = $false
-foreach ($sn in $insecure) {
-    $s = Get-Service -Name $sn
-    if (-not $s) { continue }
-    if ($s.Status -eq 'Running' -or $s.StartType -eq 'Automatic') {
-        Add-Fail "Небезопасная/лишняя служба активна или в автозагрузке: $sn ($($s.DisplayName); Status=$($s.Status), Start=$($s.StartType))" `
-                 "Stop-Service $sn -Force; Set-Service $sn -StartupType Disabled"
-        $foundInsecure = $true
-    } else { Add-Info "Служба $sn установлена, но остановлена и не в автозагрузке" }
+# OS lifecycle (end-of-support dates - edit here when Microsoft publishes changes)
+# build -> @(Home/Pro end date, Enterprise/Education end date)
+$LcClient = @{
+    19045 = @('2025-10-14', '2025-10-14'); 22000 = @('2023-10-10', '2024-10-08'); 22621 = @('2024-10-08', '2025-10-14')
+    22631 = @('2025-11-11', '2026-11-10'); 26100 = @('2026-10-13', '2027-10-12'); 26200 = @('2027-10-12', '2028-10-10') }
+$LcServer = @{
+    7601 = '2020-01-14'; 9200 = '2023-10-10'; 9600 = '2023-10-10'; 14393 = '2027-01-12'
+    17763 = '2029-01-09'; 20348 = '2031-10-14'; 26100 = '2034-10-10' }
+$isLtsc = $EditionId -match 'EnterpriseS|IoTEnterpriseS'
+$eosText = $null; $eosNote = ''
+if ($isLtsc) { Add-Info "LTSC/LTSB edition ($EditionId, build $Build) - verify lifecycle at https://learn.microsoft.com/lifecycle" }
+elseif ($IsServer -and $LcServer.ContainsKey($Build)) { $eosText = $LcServer[$Build] }
+elseif (-not $IsServer -and $LcClient.ContainsKey($Build)) {
+    $isEnt = $EditionId -match 'Enterprise|Education'
+    $eosText = $LcClient[$Build][[int]$isEnt]
+    if ($Build -eq 19045) { $eosNote = ' (Windows 10 - only devices enrolled in Extended Security Updates still receive patches)' }
+} elseif (-not $IsServer -and $Build -lt 19045) { $eosText = '2000-01-01' }
+elseif ($Build -lt 7601 -or ($IsServer -and $Build -lt 14393)) { $eosText = '2000-01-01' }
+else { Add-Info "OS build $Build is not in the lifecycle table - verify support status manually" }
+if ($eosText) {
+    $eos = [datetime]::ParseExact($eosText, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $days = [int](($eos - $RunTs.Date).TotalDays)
+    if ($days -lt 0) { Add-Fail "OS build $Build reached end of support on $eosText$eosNote" 'Upgrade to a supported Windows release' }
+    elseif ($days -le 180) { Add-Warn "OS build $Build end of support in $days days ($eosText)" 'Plan upgrade to a supported Windows release' }
+    else { Add-Pass "OS build $Build is in support until $eosText" }
 }
-if (-not $foundInsecure) { Add-Pass 'Активных небезопасных служб (Telnet/FTP/SNMP/RemoteRegistry/SSDP/UPnP/Browser) не обнаружено' }
 
-$spool = Get-Service -Name Spooler
-if ($spool -and $spool.Status -eq 'Running') {
-    if ($IsServer) {
-        Add-Warn 'Служба Print Spooler запущена на сервере (вектор PrintNightmare; CIS L2 для member server)' `
-                 'Если сервер не печатающий: Stop-Service Spooler -Force; Set-Service Spooler -StartupType Disabled'
-    } else {
-        Add-Info 'Служба Print Spooler запущена (штатно для рабочей станции; на серверах оценивается как WARN)'
+# Legacy / insecure services
+$svcChecks = @(
+    @{ N = 'TlntSvr';    D = 'Telnet Server';               S = 'FAIL' },
+    @{ N = 'simptcp';    D = 'Simple TCP/IP Services';      S = 'FAIL' },
+    @{ N = 'ftpsvc';     D = 'IIS FTP Server';              S = 'WARN' },
+    @{ N = 'SNMP';       D = 'SNMP Service';                S = 'WARN' },
+    @{ N = 'RemoteRegistry'; D = 'Remote Registry';         S = 'WARN' },
+    @{ N = 'SSDPSRV';    D = 'SSDP Discovery';              S = 'WARN' },
+    @{ N = 'upnphost';   D = 'UPnP Device Host';            S = 'WARN' },
+    @{ N = 'WebClient';  D = 'WebClient (WebDAV)';          S = 'WARN' },
+    @{ N = 'lltdsvc';    D = 'Link-Layer Topology Discovery Mapper'; S = 'WARN' },
+    @{ N = 'RpcLocator'; D = 'Remote Procedure Call Locator'; S = 'WARN' },
+    @{ N = 'icssvc';     D = 'Windows Mobile Hotspot Service'; S = 'WARN' }
+)
+if ($IsServer) { $svcChecks += @{ N = 'Spooler'; D = 'Print Spooler'; S = $(if ($IsDC) { 'FAIL' } else { 'WARN' }) } }
+else { foreach ($x in 'XblAuthManager', 'XblGameSave', 'XboxGipSvc', 'XboxNetApiSvc') { $svcChecks += @{ N = $x; D = "Xbox service ($x)"; S = 'WARN' } } }
+$foundInsecure = 0
+foreach ($c in $svcChecks) {
+    $s = Get-Service -Name $c.N -ErrorAction SilentlyContinue
+    if ($s -and ($s.Status -eq 'Running' -or "$($s.StartType)" -eq 'Automatic')) {
+        $foundInsecure++
+        Add-Result $c.S "Insecure/unnecessary service active: $($c.D) (status=$($s.Status), start=$($s.StartType))" "Stop-Service $($c.N) -Force; Set-Service $($c.N) -StartupType Disabled"
     }
-} else { Add-Pass 'Print Spooler не запущен' }
-
-$allRunning = @(Get-Service | Where-Object { $_.Status -eq 'Running' }).Count
-Add-Info "Всего запущенных служб: ${allRunning}"
-
-# Unquoted service path (классический вектор повышения привилегий)
-$badSvc = @()
-foreach ($s in @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -match '^[A-Za-z]:\\' })) {
-    $p = $s.PathName.Trim()
-    if ($p.StartsWith('"')) { continue }
-    if ($p -match '^(?<exe>.+?\.exe)(\s|$)') { if ($Matches['exe'] -match '\s') { $badSvc += "$($s.Name) [$p]" } }
 }
-if ($badSvc.Count -eq 0) { Add-Pass 'Служб с неквотированными путями к исполняемым файлам (unquoted service path) не обнаружено' }
-else {
-    Add-Fail "Обнаружены службы с unquoted service path: $($badSvc.Count)" `
-             'sc.exe config <имя_службы> binPath= "\"<полный_путь>\" <аргументы>" (или правка ImagePath в HKLM\SYSTEM\CurrentControlSet\Services\<имя>)'
-    $badSvc | Select-Object -First 20 | ForEach-Object { Write-Log "         $_" }
-}
+if ($foundInsecure -eq 0) { Add-Pass 'No active insecure/legacy services (Telnet/SNMP/RemoteRegistry/SSDP/WebClient/...) detected' }
 
-# Целостность: подписи ключевых бинарников (быстрый аналог rpm -Va по критичным файлам)
-$sys32 = "$env:SystemRoot\System32"
-$keyBins = @("$sys32\cmd.exe", "$sys32\lsass.exe", "$sys32\services.exe", "$sys32\winlogon.exe", "$sys32\svchost.exe",
-             "$sys32\ntoskrnl.exe", "$sys32\kernel32.dll", "$sys32\ntdll.dll", "$sys32\WindowsPowerShell\v1.0\powershell.exe")
-$sigBad = @(); $sigChecked = 0
-foreach ($f in $keyBins) {
-    if (-not (Test-Path -LiteralPath $f)) { continue }
-    $sigChecked++
-    $sig = Get-AuthenticodeSignature -FilePath $f
-    if (-not $sig -or "$($sig.Status)" -ne 'Valid') { $sigBad += "$f ($($sig.Status))" }
+# Unquoted service paths
+$unq = @()
+foreach ($sv in @(Get-CimInstance Win32_Service)) {
+    $pn = [string]$sv.PathName
+    if ($pn -and $pn -notmatch '^\s*"' -and $pn -match '^\s*(?<exe>.+?\.exe)(\s|$)') { if ($Matches['exe'] -match '\s') { $unq += "$($sv.Name) => $pn" } }
 }
-if ($sigChecked -eq 0) { Add-Warn 'Ключевые системные бинарники не найдены для проверки подписи' }
-elseif ($sigBad.Count -eq 0) { Add-Pass "Цифровые подписи ключевых системных файлов валидны (проверено: ${sigChecked})" }
-else {
-    Add-Fail "Невалидная подпись системных файлов: $($sigBad -join '; ')" `
-             'Сверить хэш с эталоном; при подозрении на компрометацию: sfc /scannow; DISM /Online /Cleanup-Image /RestoreHealth'
+if ($unq.Count -eq 0) { Add-Pass 'No services with unquoted executable paths containing spaces' }
+else { Add-Fail "Services with unquoted paths (privilege-escalation risk): $($unq -join ' | ')" 'sc.exe config <service> binPath= "\"C:\Full Path\service.exe\" <args>"' }
+
+# Optional Windows features
+foreach ($f in @(@{ N = 'SMB1Protocol'; S = 'FAIL' }, @{ N = 'TelnetClient'; S = 'WARN' }, @{ N = 'TFTP'; S = 'WARN' },
+                 @{ N = 'MicrosoftWindowsPowerShellV2Root'; S = 'WARN' })) {
+    $feat = Get-WindowsOptionalFeature -Online -FeatureName $f.N -ErrorAction SilentlyContinue
+    if ($feat -and "$($feat.State)" -eq 'Enabled') { Add-Result $f.S "Legacy Windows feature enabled: $($f.N)" "Disable-WindowsOptionalFeature -Online -FeatureName $($f.N) -NoRestart" }
+    elseif ($feat) { Add-Pass "Legacy Windows feature not enabled: $($f.N)" }
 }
 
+# System integrity (equivalent of debsums)
+$health = Repair-WindowsImage -Online -CheckHealth -ErrorAction SilentlyContinue
+if ($health) {
+    if ("$($health.ImageHealthState)" -eq 'Healthy') { Add-Pass 'Component store health (DISM CheckHealth): Healthy' }
+    else { Add-Fail "Component store health (DISM CheckHealth): $($health.ImageHealthState)" 'DISM /Online /Cleanup-Image /RestoreHealth' }
+} else { Add-Warn 'DISM CheckHealth could not be executed' 'Run: DISM /Online /Cleanup-Image /CheckHealth' }
 if ($DeepScan) {
-    Add-Info 'DeepScan: запуск DISM ScanHealth и sfc /verifyonly (может занять 5-20 минут)...'
-    $img = Repair-WindowsImage -Online -ScanHealth
-    if ($img) {
-        if ("$($img.ImageHealthState)" -eq 'Healthy') { Add-Pass 'DISM ScanHealth: хранилище компонентов не повреждено (Healthy)' }
-        else { Add-Fail "DISM ScanHealth: состояние $($img.ImageHealthState)" 'DISM /Online /Cleanup-Image /RestoreHealth' }
-    } else { Add-Warn 'DISM ScanHealth не удалось выполнить (Repair-WindowsImage недоступен)' }
-    $sfcOut = (& sfc.exe /verifyonly 2>&1 | Out-String) -replace "`0", ''
-    if ($sfcOut -match 'did not find any integrity violations|не обнаружила нарушений целостности|не обнаружено нарушений целостности') {
-        Add-Pass 'sfc /verifyonly: нарушений целостности не обнаружено'
-    } elseif ($sfcOut -match 'found integrity violations|обнаружила поврежденные|обнаружены поврежденные|обнаружила нарушения') {
-        Add-Fail 'sfc /verifyonly: обнаружены нарушения целостности системных файлов' 'sfc /scannow (детали: %windir%\Logs\CBS\CBS.log)'
-    } else { Add-Info 'sfc /verifyonly: результат не распознан - проверьте вручную (sfc /verifyonly)' }
-} else {
-    Add-Info 'Глубокая проверка целостности (DISM/sfc) пропущена - запустите с -DeepScan'
+    Add-Info 'Running sfc /verifyonly (this may take several minutes)...'
+    $sfc = (& sfc.exe /verifyonly 2>&1 | Out-String) -replace "`0", ''
+    if ($sfc -match 'did not find any integrity violations') { Add-Pass 'System File Checker: no integrity violations' }
+    elseif ($sfc -match 'found integrity violations') { Add-Fail 'System File Checker found integrity violations' 'sfc /scannow   # then DISM /Online /Cleanup-Image /RestoreHealth; review CBS.log' }
+    else { Add-Warn 'System File Checker result could not be interpreted' 'Review %windir%\Logs\CBS\CBS.log' }
+} else { Add-Info 'sfc /verifyonly skipped (use -DeepScan for full system file verification)' }
+
+# Updates
+$wu = Get-Service -Name wuauserv
+if ($wu -and "$($wu.StartType)" -eq 'Disabled') { Add-Fail 'Windows Update service (wuauserv) is DISABLED' 'Set-Service wuauserv -StartupType Manual' }
+else { Add-Pass 'Windows Update service is not disabled' }
+$hf = Get-HotFix | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1
+$lastUpdId = $null; $lastUpdDate = $null
+if ($hf) { $lastUpdId = $hf.HotFixID; $lastUpdDate = [datetime]$hf.InstalledOn }
+else {
+    # Fallback: Windows Update Agent history (Operation=1 installation, ResultCode=2 succeeded)
+    try {
+        $hs = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $hist = @($hs.QueryHistory(0, [int]$hs.GetTotalHistoryCount()) | Where-Object { $_.Operation -eq 1 -and $_.ResultCode -eq 2 } | Sort-Object Date -Descending | Select-Object -First 1)
+        if ($hist.Count -gt 0) { $lastUpdId = ($hist[0].Title -replace '^(.{0,60}).*$', '$1'); $lastUpdDate = [datetime]$hist[0].Date }
+    } catch { }
 }
-
-# Обновления
-$hf = @(Get-HotFix | Where-Object { $_.InstalledOn } | Sort-Object { [datetime]$_.InstalledOn } -Descending) | Select-Object -First 1
-if ($hf) {
-    $days = (New-TimeSpan -Start ([datetime]$hf.InstalledOn) -End (Get-Date)).Days
-    if ($days -le 35) { Add-Pass "Последнее обновление установлено ${days} дн. назад ($($hf.HotFixID))" }
-    else { Add-Warn "Последнее обновление установлено ${days} дн. назад ($($hf.HotFixID)) - давно" 'Проверить Windows Update / WSUS; установить накопительные обновления (сначала в стейджинге)' }
-} else { Add-Warn 'Не удалось определить дату последнего установленного обновления (Get-HotFix пуст)' }
-
+if ($lastUpdDate) {
+    $age = [int]($RunTs - $lastUpdDate).TotalDays
+    if ($age -le 45) { Add-Pass "Latest installed update $lastUpdId is $age days old" }
+    elseif ($age -le 90) { Add-Warn "Latest installed update $lastUpdId is $age days old (> 45)" 'Install the latest cumulative update (Windows Update / WSUS / Intune)' }
+    else { Add-Fail "Latest installed update $lastUpdId is $age days old (> 90)" 'Install the latest cumulative update immediately' }
+} else { Add-Warn 'No installed hotfix date could be determined (Get-HotFix)' }
 if (-not $SkipUpdateSearch) {
-    Add-Info 'Поиск доступных обновлений через Windows Update Agent (может занять до нескольких минут)...'
     try {
         $sess = New-Object -ComObject Microsoft.Update.Session
-        $res  = $sess.CreateUpdateSearcher().Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-        $cnt = $res.Updates.Count
-        if ($cnt -eq 0) { Add-Pass 'Доступных неустановленных обновлений нет' }
-        else {
-            $crit = 0
-            foreach ($u in $res.Updates) { if ($u.MsrcSeverity -in @('Critical', 'Important')) { $crit++ } }
-            Add-Warn "Доступны обновления: ${cnt} (Critical/Important: ${crit})" `
-                     'Установить через Windows Update/WSUS (PSWindowsUpdate: Install-WindowsUpdate -AcceptAll); протестировать в стейджинге перед прод-раскаткой'
-        }
-    } catch { Add-Warn "Не удалось выполнить поиск обновлений: $($_.Exception.Message)" 'Проверить доступ к WSUS/Windows Update или запускать с -SkipUpdateSearch' }
-} else { Add-Info 'Поиск обновлений пропущен (-SkipUpdateSearch)' }
-
-$pendReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
-              (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
-              ($null -ne (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations'))
-if ($pendReboot) { Add-Warn 'Ожидается перезагрузка для завершения установки обновлений/изменений' 'Запланировать окно обслуживания и перезагрузить хост' }
-else { Add-Pass 'Отложенной перезагрузки нет' }
+        $res  = $sess.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+        $cnt  = [int]$res.Updates.Count
+        $sec  = @($res.Updates | Where-Object { $_.MsrcSeverity -in 'Critical', 'Important' }).Count
+        if ($cnt -eq 0) { Add-Pass 'System is fully updated (Windows Update Agent search)' }
+        else { Add-Warn "Pending updates available: $cnt (Critical/Important: $sec)" 'Install-WindowsUpdate (PSWindowsUpdate) or Settings > Windows Update' }
+    } catch { Add-Warn 'Windows Update Agent search failed (no WU/WSUS connectivity?)' 'Re-run with -SkipUpdateSearch or check update source' }
+} else { Add-Info 'Pending update search skipped (-SkipUpdateSearch)' }
+$pend = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'WindowsUpdate' }
+if ($pend.Count -gt 0) { Add-Warn "Pending reboot detected ($($pend -join ', '))" 'Restart the system to complete pending updates' } else { Add-Pass 'No pending reboot' }
 
 # ============================================================================
-# 6. HARDENING ОС (UAC / LSA / NTLM / Defender / шифрование / TLS)
+# 6. BOOT SECURITY, DISK ENCRYPTION, ANTI-MALWARE, AND APPLICATION CONTROL
 # ============================================================================
 
-Start-Section '6. HARDENING ОС (UAC / LSA / NTLM / Defender / шифрование / TLS)'
-
-$pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-Test-RegSetting -Path $pol -Name 'EnableLUA' -Expected 1 -DefaultIfMissing 1 -Severity FAIL -Desc 'UAC включён (CIS 2.3.17.6)'
-$cp = Get-RegValue $pol 'ConsentPromptBehaviorAdmin'
-if ($null -eq $cp) { $cp = 5 }
-if ($cp -in @(1, 2)) { Add-Pass "UAC: запрос для администраторов на защищённом рабочем столе (ConsentPromptBehaviorAdmin=${cp})" }
-elseif ($cp -eq 0)   { Add-Fail 'UAC: повышение прав администраторов без запроса (ConsentPromptBehaviorAdmin=0)' "Set-ItemProperty '$pol' ConsentPromptBehaviorAdmin 2" }
-else                 { Add-Warn "UAC: ConsentPromptBehaviorAdmin=${cp} (CIS: 2 - consent на secure desktop)" "Set-ItemProperty '$pol' ConsentPromptBehaviorAdmin 2" }
-Test-RegSetting -Path $pol -Name 'LocalAccountTokenFilterPolicy' -Expected 0 -DefaultIfMissing 0 -Severity WARN `
-    -Desc 'UAC-ограничения для локальных учётных записей при сетевом входе (защита от pass-the-hash)'
-
-$it = Get-RegValue $pol 'InactivityTimeoutSecs'
-if ($null -ne $it -and $it -ge 1 -and $it -le 900) { Add-Pass "Блокировка экрана по неактивности: ${it} с (<= 900)" }
-else { Add-Warn "Блокировка по неактивности не настроена или > 900 с (текущее: $(if ($null -eq $it) { 'не задано' } else { $it })) (CIS 2.3.7.3)" "Set-ItemProperty '$pol' InactivityTimeoutSecs 900" }
-Test-RegSetting -Path $pol -Name 'DontDisplayLastUserName' -Expected 1 -Severity WARN -Desc 'Не показывать имя последнего пользователя на экране входа (CIS 2.3.7.2)'
-$ln = Get-RegValue $pol 'LegalNoticeText'
-if ($ln) { Add-Pass 'Задан юридический баннер при входе (LegalNoticeText)' }
-else { Add-Warn 'Юридический баннер при входе не задан (CIS 2.3.7.4/2.3.7.5, ISO 27001 A.5.10)' "Set-ItemProperty '$pol' LegalNoticeCaption 'Warning'; Set-ItemProperty '$pol' LegalNoticeText 'Authorized use only. Activity is monitored.'" }
-
-$lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
-$lm = Get-RegValue $lsa 'LmCompatibilityLevel'
-if ($null -eq $lm) { $lm = 3; $lmSrc = ' [default ОС]' } else { $lmSrc = '' }
-if ($lm -ge 5) { Add-Pass "NTLM: LmCompatibilityLevel = ${lm}${lmSrc} (только NTLMv2)" }
-elseif ($lm -ge 3) { Add-Warn "NTLM: LmCompatibilityLevel = ${lm}${lmSrc} (CIS 2.3.11.7: 5 - отказ от LM и NTLMv1)" "Set-ItemProperty '$lsa' LmCompatibilityLevel 5 -Type DWord" }
-else { Add-Fail "NTLM: LmCompatibilityLevel = ${lm}${lmSrc} - разрешены LM/NTLMv1" "Set-ItemProperty '$lsa' LmCompatibilityLevel 5 -Type DWord" }
-Test-RegSetting -Path $lsa -Name 'NoLMHash'           -Expected 1 -DefaultIfMissing 1 -Severity FAIL -Desc 'Запрет хранения LM-хэшей паролей (CIS 2.3.11.5)'
-Test-RegSetting -Path $lsa -Name 'RestrictAnonymousSAM' -Expected 1 -DefaultIfMissing 1 -Severity FAIL -Desc 'Запрет анонимного перечисления SAM (CIS 2.3.10.2)'
-Test-RegSetting -Path $lsa -Name 'RestrictAnonymous'  -Expected 1 -Op ge -DefaultIfMissing 0 -Severity WARN -Desc 'Запрет анонимного перечисления SAM и шар (CIS 2.3.10.3)'
-Test-RegSetting -Path $lsa -Name 'EveryoneIncludesAnonymous' -Expected 0 -DefaultIfMissing 0 -Severity FAIL -Desc 'Everyone не включает анонимных пользователей (CIS 2.3.10.5)'
-Test-RegSetting -Path $lsa -Name 'RunAsPPL'           -Expected 1 -Op ge -Severity WARN -Desc 'LSA Protection (LSASS как protected process, CIS L2)'
-Test-RegSetting -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential' `
-    -Expected 0 -DefaultIfMissing 0 -Severity FAIL -Desc 'WDigest: пароли в открытом виде в памяти отключены (CIS 18.4.7)'
-
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoDriveTypeAutoRun' `
-    -Expected 255 -Severity WARN -Desc 'AutoPlay отключён для всех типов дисков (CIS 18.10.8.3)'
-Test-RegSetting -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoAutorun' `
-    -Expected 1 -Severity WARN -Desc 'AutoRun: команды autorun.inf не выполняются (CIS 18.10.8.2)'
-
-# TLS/SSL (SCHANNEL) - ISO 27001 A.8.24
-foreach ($proto in 'SSL 2.0', 'SSL 3.0') {
-    $k = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$proto\Server"
-    $en = Get-RegValue $k 'Enabled'
-    if ($en -eq 1) { Add-Fail "SCHANNEL: протокол ${proto} (сервер) явно ВКЛЮЧЁН" "New-ItemProperty -Path '$k' -Name Enabled -Value 0 -PropertyType DWord -Force" }
-    else { Add-Pass "SCHANNEL: протокол ${proto} (сервер) отключён (Enabled=$(if ($null -eq $en) { 'не задан, default ОС = выключен' } else { $en }))" }
-}
-foreach ($proto in 'TLS 1.0', 'TLS 1.1') {
-    $k = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$proto\Server"
-    $en = Get-RegValue $k 'Enabled'
-    $remTls = "New-Item -Path '$k' -Force | Out-Null; New-ItemProperty -Path '$k' -Name Enabled -Value 0 -PropertyType DWord -Force; New-ItemProperty -Path '$k' -Name DisabledByDefault -Value 1 -PropertyType DWord -Force (проверить совместимость приложений)"
-    if ($en -eq 0) { Add-Pass "SCHANNEL: протокол ${proto} (сервер) явно отключён" }
-    elseif ($en -eq 1) { Add-Warn "SCHANNEL: протокол ${proto} (сервер) явно ВКЛЮЧЁН" $remTls }
-    else { Add-Warn "SCHANNEL: протокол ${proto} (сервер) не отключён явно (поведение зависит от версии ОС)" $remTls }
-}
-
-# Антивирус / EDR
-$mp = Get-MpComputerStatus
-if ($mp -and $null -ne $mp.AMServiceEnabled) {
-    if ($mp.AMServiceEnabled) { Add-Pass 'Microsoft Defender Antivirus: служба включена' }
-    else { Add-Fail 'Microsoft Defender Antivirus: служба отключена' 'Set-Service WinDefend -StartupType Automatic; Start-Service WinDefend (проверить GPO/стороннее AV)' }
-    if ($mp.RealTimeProtectionEnabled) { Add-Pass 'Defender: защита в реальном времени включена' }
-    else { Add-Fail 'Defender: защита в реальном времени ОТКЛЮЧЕНА' 'Set-MpPreference -DisableRealtimeMonitoring $false' }
-    if ($mp.IsTamperProtected) { Add-Pass 'Defender: Tamper Protection включена' }
-    else { Add-Warn 'Defender: Tamper Protection не включена' 'Включить через Windows Security > Virus & threat protection settings (или Intune)' }
-    $age = $mp.AntivirusSignatureAge
-    if ($null -ne $age -and $age -le 7) { Add-Pass "Defender: сигнатуры обновлены ${age} дн. назад" }
-    else { Add-Warn "Defender: сигнатурам ${age} дн. (рекомендуется <= 7)" 'Update-MpSignature' }
-} else {
-    $av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct | ForEach-Object { $_.displayName })
-    if ($av.Count -gt 0) { Add-Info "Defender недоступен; зарегистрированные AV/EDR: $($av -join ', ') - проверьте их статус в консоли управления" }
-    else { Add-Fail 'Антивирус/EDR не обнаружен (Defender недоступен, SecurityCenter2 пуст)' 'Установить и включить AV/EDR; на серверах проверить, что Defender не удалён (Get-WindowsFeature Windows-Defender)' }
-}
-
-# Шифрование диска и Secure Boot
-$bl = Get-BitLockerVolume -MountPoint $env:SystemDrive
-if ($bl) {
-    if ("$($bl.ProtectionStatus)" -eq 'On') { Add-Pass "BitLocker: системный том ${env:SystemDrive} защищён (ProtectionStatus=On)" }
-    else { Add-Warn "BitLocker: системный том ${env:SystemDrive} не защищён (ProtectionStatus=$($bl.ProtectionStatus)) (ISO 27001 A.8.24, CIS L2)" "Enable-BitLocker -MountPoint ${env:SystemDrive} -EncryptionMethod XtsAes256 -RecoveryPasswordProtector" }
-} else { Add-Info 'BitLocker недоступен (модуль/компонент не установлен) - проверка шифрования диска пропущена' }
+Write-Section '6. SECURE BOOT, TPM, BITLOCKER, DEFENDER, AND APPLICATION CONTROL'
 
 try {
-    if (Confirm-SecureBootUEFI -ErrorAction Stop) { Add-Pass 'Secure Boot включён' }
-    else { Add-Warn 'Secure Boot отключён' 'Включить Secure Boot в UEFI/настройках гипервизора (Gen2 VM)' }
-} catch { Add-Info 'Secure Boot: не поддерживается или Legacy BIOS (проверка пропущена)' }
+    if (Confirm-SecureBootUEFI -ErrorAction Stop) { Add-Pass 'Secure Boot is enabled' }
+    else { Add-Fail 'Secure Boot is DISABLED' 'Enable Secure Boot in UEFI firmware setup' }
+} catch { Add-Warn 'Secure Boot state cannot be determined (Legacy BIOS boot or unsupported platform)' 'Convert to UEFI/GPT (mbr2gpt /convert /allowFullOS) and enable Secure Boot' }
 
-# ============================================================================
-# 7. ИТОГОВАЯ СВОДКА
-# ============================================================================
+$tpm = Get-Tpm -ErrorAction SilentlyContinue
+if ($tpm -and $tpm.TpmPresent) {
+    $tv = (Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction SilentlyContinue).SpecVersion
+    if ($tpm.TpmReady) { Add-Pass "TPM present and ready (spec: $tv)" } else { Add-Warn "TPM present but not ready (spec: $tv)" 'Initialize-Tpm' }
+    if ($tv -and $tv -match '^1\.2') { Add-Warn 'TPM 1.2 detected - TPM 2.0 recommended' }
+} else { Add-Result $(if ($IsServer) { 'WARN' } else { 'FAIL' }) 'No TPM detected (or TPM disabled in firmware)' 'Enable TPM/PTT in firmware; for VMs use vTPM' }
 
-Start-Section '7. ИТОГОВАЯ СВОДКА АУДИТА'
-$total = $script:CountPass + $script:CountWarn + $script:CountFail
-Write-Log "  PASS : $script:CountPass" 'Green'
-Write-Log "  WARN : $script:CountWarn" 'Yellow'
-Write-Log "  FAIL : $script:CountFail" 'Red'
-Write-Log "  INFO : $script:CountInfo"
-Write-Log "  Всего классифицированных проверок: $total"
-Write-Log ''
-if ($script:CountFail -gt 0) {
-    Write-Log '  РЕЗУЛЬТАТ: обнаружены критические несоответствия (FAIL). Требуется устранение.' 'Red'; $ExitCode = 2
-} elseif ($script:CountWarn -gt 0) {
-    Write-Log '  РЕЗУЛЬТАТ: критических несоответствий нет, но есть замечания (WARN).' 'Yellow'; $ExitCode = 1
+$sysDrive = $env:SystemDrive
+if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+    $bl = Get-BitLockerVolume -MountPoint $sysDrive -ErrorAction SilentlyContinue
+    if ($bl -and "$($bl.ProtectionStatus)" -in 'On', '1') { Add-Pass "BitLocker protection is ON for $sysDrive ($($bl.EncryptionMethod), $($bl.VolumeStatus))" }
+    else { Add-Result $(if ($IsServer) { 'WARN' } else { 'FAIL' }) "BitLocker protection is not active on $sysDrive (status: $(if ($bl) { $bl.ProtectionStatus } else { 'unknown' }))" "Enable-BitLocker -MountPoint $sysDrive -EncryptionMethod XtsAes256 -TpmProtector" }
+} else { Add-Result $(if ($IsServer) { 'WARN' } else { 'FAIL' }) 'BitLocker cmdlets unavailable (feature not installed)' 'Install-WindowsFeature BitLocker (Server) / enable BitLocker (client)' }
+
+$bcd = (& bcdedit.exe /enum '{current}' 2>$null | Out-String)
+if ($bcd) {
+    $bad = 0
+    foreach ($k in 'testsigning', 'nointegritychecks', 'debug') {
+        if ($bcd -match "(?im)^\s*$k\s+Yes") { $bad++; Add-Fail "Boot configuration: $k is ENABLED" "bcdedit /set '{current}' $k off" }
+    }
+    if ($bad -eq 0) { Add-Pass 'Boot configuration: test-signing / integrity-check bypass / kernel debug are off' }
+} else { Add-Warn 'bcdedit output unavailable - boot configuration not verified' }
+
+# Microsoft Defender / anti-malware
+$mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
+if ($mp) {
+    if ("$($mp.AMRunningMode)" -match 'Passive') { Add-Info "Microsoft Defender runs in $($mp.AMRunningMode) (third-party AV primary)" }
+    elseif ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled) { Add-Pass 'Microsoft Defender antivirus and real-time protection are enabled' }
+    else { Add-Fail "Microsoft Defender not fully active (AV=$($mp.AntivirusEnabled), RealTime=$($mp.RealTimeProtectionEnabled))" 'Set-MpPreference -DisableRealtimeMonitoring $false; Start-Service WinDefend' }
+    if ($mp.AntivirusSignatureAge -le 7) { Add-Pass "Defender signatures are $($mp.AntivirusSignatureAge) days old" }
+    else { Add-Warn "Defender signatures are $($mp.AntivirusSignatureAge) days old (> 7)" 'Update-MpSignature' }
+    if ($null -ne $mp.IsTamperProtected) { if ($mp.IsTamperProtected) { Add-Pass 'Defender Tamper Protection is enabled' } else { Add-Warn 'Defender Tamper Protection is disabled' 'Enable Tamper Protection in Windows Security or Intune/MDE' } }
+    if ($mp.BehaviorMonitorEnabled) { Add-Pass 'Defender behavior monitoring is enabled' } else { Add-Warn 'Defender behavior monitoring is disabled' 'Set-MpPreference -DisableBehaviorMonitoring $false' }
+    if ($mp.IoavProtectionEnabled)  { Add-Pass 'Defender download/attachment scanning (IOAV) is enabled' } else { Add-Warn 'Defender IOAV protection is disabled' 'Set-MpPreference -DisableIOAVProtection $false' }
+    $pref = Get-MpPreference -ErrorAction SilentlyContinue
+    if ($pref) {
+        if ($pref.PUAProtection -eq 1) { Add-Pass 'Defender PUA protection is enabled' } else { Add-Warn "Defender PUA protection = $($pref.PUAProtection) (expected 1)" 'Set-MpPreference -PUAProtection Enabled' }
+        if ($pref.EnableNetworkProtection -eq 1) { Add-Pass 'Defender Network Protection is in block mode' } else { Add-Warn "Defender Network Protection = $($pref.EnableNetworkProtection) (expected 1)" 'Set-MpPreference -EnableNetworkProtection Enabled' }
+        $asrIds = @($pref.AttackSurfaceReductionRules_Ids); $asrAct = @($pref.AttackSurfaceReductionRules_Actions)
+        $asrBlock = 0; for ($i = 0; $i -lt $asrIds.Count; $i++) { if ($asrAct[$i] -eq 1) { $asrBlock++ } }
+        if ($asrBlock -gt 0) { Add-Pass "Attack Surface Reduction: $asrBlock rules in Block mode" } else { Add-Warn 'Attack Surface Reduction: no rules in Block mode (Level 2)' "Add-MpPreference -AttackSurfaceReductionRules_Ids <GUID> -AttackSurfaceReductionRules_Actions Enabled" }
+        $exN = @($pref.ExclusionPath).Count + @($pref.ExclusionProcess).Count + @($pref.ExclusionExtension).Count
+        Add-Info "Defender exclusions configured: paths=$(@($pref.ExclusionPath).Count), processes=$(@($pref.ExclusionProcess).Count), extensions=$(@($pref.ExclusionExtension).Count)"
+        $wide = @($pref.ExclusionPath | Where-Object { $_ -match '^[A-Za-z]:\\?\*?$' })
+        if ($wide.Count -gt 0) { Add-Fail "Defender exclusion covers an entire drive: $($wide -join ', ')" 'Remove-MpPreference -ExclusionPath <path>' }
+    }
 } else {
-    Write-Log '  РЕЗУЛЬТАТ: все проверки пройдены успешно.' 'Green'; $ExitCode = 0
+    $av = @(Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction SilentlyContinue | ForEach-Object { $_.displayName })
+    if ($av.Count -gt 0) { Add-Info "Microsoft Defender cmdlets unavailable; registered AV product(s): $($av -join ', ')" }
+    else { Add-Fail 'No active anti-malware product detected (Defender unavailable, no third-party AV registered)' 'Install-WindowsFeature Windows-Defender (Server) / enable Microsoft Defender or deploy an EDR' }
+}
+
+# Application control (equivalent of AppArmor / SELinux)
+$dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+$wdac = if ($dg) { [int]$dg.CodeIntegrityPolicyEnforcementStatus } else { 0 }
+$alRules = 0
+try { $ap = Get-AppLockerPolicy -Effective -ErrorAction Stop; foreach ($rc in $ap.RuleCollections) { $alRules += @($rc).Count } } catch { }
+$appId = Get-Service -Name AppIDSvc
+if ($wdac -eq 2) { Add-Pass 'WDAC (App Control for Business) policy is enforced' }
+elseif ($alRules -gt 0 -and $appId -and $appId.Status -eq 'Running') { Add-Pass "AppLocker is active ($alRules effective rules, AppIDSvc running)" }
+elseif ($wdac -eq 1 -or $alRules -gt 0) { Add-Warn 'Application control is configured but only in audit mode / AppIDSvc not running' 'Move WDAC/AppLocker policy to enforced mode and start AppIDSvc' }
+else { Add-Warn 'No application control (WDAC / AppLocker) enforced (Level 2)' 'Deploy WDAC or AppLocker policy (start in audit mode)' }
+
+# ============================================================================
+# 7. EXPLOIT MITIGATIONS AND CREDENTIAL PROTECTION
+# ============================================================================
+
+Write-Section '7. EXPLOIT MITIGATIONS, VBS/HVCI, AND CREDENTIAL PROTECTION'
+
+switch ([int]$OsCim.DataExecutionPrevention_SupportPolicy) {
+    0 { Add-Fail 'DEP is fully disabled (AlwaysOff)' "bcdedit /set nx OptOut" }
+    1 { Add-Pass 'DEP policy: AlwaysOn' }
+    2 { Add-Warn 'DEP policy: OptIn (protects essential Windows programs only)' "bcdedit /set nx OptOut" }
+    3 { Add-Pass 'DEP policy: OptOut (all programs except exclusions)' }
+}
+$mi = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'MoveImages'
+if ($mi -eq 0) { Add-Fail 'ASLR image relocation is disabled (MoveImages = 0)' (New-RegFix 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'MoveImages' 4294967295) }
+else { Add-Pass 'ASLR image relocation is not disabled' }
+if ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation') -eq 1) { Add-Fail 'SEHOP is disabled (DisableExceptionChainValidation = 1)' (New-RegFix 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 0) }
+else { Add-Pass 'SEHOP is not disabled' }
+
+$pm = $null
+try { $pm = Get-ProcessMitigation -System -ErrorAction Stop } catch { }
+if ($pm) {
+    foreach ($m in @(@{ N = 'DEP'; V = "$($pm.DEP.Enable)" }, @{ N = 'SEHOP'; V = "$($pm.SEHOP.Enable)" }, @{ N = 'ASLR BottomUp'; V = "$($pm.ASLR.BottomUp)" },
+                     @{ N = 'ASLR HighEntropy'; V = "$($pm.ASLR.HighEntropy)" }, @{ N = 'Control Flow Guard'; V = "$($pm.CFG.Enable)" })) {
+        switch ($m.V) {
+            'ON'  { Add-Pass "System exploit mitigation $($m.N): ON" }
+            'OFF' { Add-Fail "System exploit mitigation $($m.N): OFF" "Set-ProcessMitigation -System -Enable $(($m.N -replace 'ASLR ', '' -replace 'Control Flow Guard', 'CFG' -replace ' ', ''))" }
+            default { Add-Info "System exploit mitigation $($m.N): $($m.V) (OS default)" }
+        }
+    }
+} else { Add-Info 'Get-ProcessMitigation unavailable on this OS build - exploit mitigation settings not enumerated' }
+
+if ($dg) {
+    $running = @($dg.SecurityServicesRunning)
+    if ([int]$dg.VirtualizationBasedSecurityStatus -eq 2) { Add-Pass 'Virtualization-based security (VBS) is running' }
+    else { Add-Warn 'Virtualization-based security (VBS) is not running (Level 2)' 'Enable VBS via GPO: Computer Configuration > Administrative Templates > System > Device Guard' }
+    if ($running -contains 2) { Add-Pass 'HVCI (memory integrity) is running' } else { Add-Warn 'HVCI (memory integrity) is not running (Level 2)' 'Enable Memory integrity in Windows Security > Device security > Core isolation' }
+    if ($running -contains 1) { Add-Pass 'Credential Guard is running' } else { Add-Warn 'Credential Guard is not running (Level 2)' 'Enable via GPO: Turn On Virtualization Based Security > Credential Guard Configuration' }
+} else { Add-Info 'Win32_DeviceGuard not available - VBS/HVCI/Credential Guard state unknown' }
+
+Test-RegTable @(
+    @{ Path = $Lsa; Name = 'RunAsPPL'; Value = 1; Op = 'ge'; Desc = 'LSA protection (LSASS as Protected Process Light)'; Sev = 'WARN' },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'; Name = 'UseLogonCredential'; Value = 0; Desc = 'WDigest does not cache cleartext credentials'; Default = $true },
+    @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config'; Name = 'VulnerableDriverBlocklistEnable'; Value = 1; Desc = 'Microsoft vulnerable driver blocklist'; Sev = 'WARN'; Default = ($Build -ge 22621) }
+)
+
+# ============================================================================
+# 8. AUDIT SUMMARY
+# ============================================================================
+
+Write-Section '8. AUDIT SUMMARY'
+
+$TotalChecks = $script:CountPass + $script:CountWarn + $script:CountFail
+Write-Raw "  PASS : $($script:CountPass)" 'Green'
+Write-Raw "  WARN : $($script:CountWarn)" 'Yellow'
+Write-Raw "  FAIL : $($script:CountFail)" 'Red'
+Write-Raw "  INFO : $($script:CountInfo)"
+Write-Raw "  Total classified checks: $TotalChecks"
+Write-Raw ''
+if ($script:CountFail -gt 0) {
+    Write-Raw '  RESULT: Critical non-compliances detected (FAIL). Remediation required.' 'Red'; $ExitCode = 2
+} elseif ($script:CountWarn -gt 0) {
+    Write-Raw '  RESULT: No critical non-compliances, but warnings exist (WARN).' 'Yellow'; $ExitCode = 1
+} else {
+    Write-Raw '  RESULT: All checks passed successfully.' 'Green'; $ExitCode = 0
 }
 
 # ============================================================================
-# 8. СОХРАНЕНИЕ ТЕКСТОВОГО ОТЧЁТА
+# 9. SAVE TEXT / JSON REPORTS
 # ============================================================================
 
 $saveOk = $true
 try {
-    if (-not (Test-Path -LiteralPath $OutputDir)) {
-        New-Item -ItemType Directory -Path $OutputDir -Force -ErrorAction Stop | Out-Null
-        # отчёт содержит чувствительные данные: только SYSTEM и Administrators
-        & icacls.exe $OutputDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 2>&1 | Out-Null
-    }
-    $hdr = @(
-        '==================================================================='
-        ' Security Audit Report (CIS / ISO 27001) - Windows'
-        " Host: $HostFqdn  Date: $script:RunTs"
-        '==================================================================='
-    )
-    Add-Content -LiteralPath $script:ReportFile -Value ($hdr + $script:TextBuffer.ToArray()) -Encoding UTF8 -ErrorAction Stop
-} catch { $saveOk = $false }
-if ($saveOk) { Write-Log ''; Write-Log "Текстовый отчёт сохранён/дополнен: $script:ReportFile" }
-else { Write-Log ''; Write-Log "[WARN] Не удалось записать $script:ReportFile" 'Yellow' }
+    if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force -ErrorAction Stop | Out-Null }
+    $hdr = @('===================================================================',
+             ' Security Audit Report (CIS / ISO 27001) - Windows',
+             " Host: $HostFqdn  Date: $RunTsText",
+             '===================================================================')
+    Add-Content -LiteralPath $ReportFile -Value ($hdr + $script:ReportLines) -Encoding UTF8 -ErrorAction Stop
+    Write-Raw ''
+    Write-Raw "Text report saved/updated : $ReportFile"
+} catch { $saveOk = $false; Write-Raw "[WARN] Failed to write to ${ReportFile}: $($_.Exception.Message)" 'Yellow' }
+
+try {
+    [pscustomobject]@{
+        host = $HostFqdn; os = $OsInfo; build = $BuildInfo; timestamp = $RunTs.ToString('o'); version = $script:Version
+        summary = [pscustomobject]@{ pass = $script:CountPass; warn = $script:CountWarn; fail = $script:CountFail; info = $script:CountInfo }
+        findings = @($script:Findings)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $JsonReportFile -Encoding UTF8 -ErrorAction Stop
+    Write-Raw "JSON results saved        : $JsonReportFile"
+} catch { Write-Raw "[WARN] Failed to write JSON results: $($_.Exception.Message)" 'Yellow' }
 
 # ============================================================================
-# 9. ГЕНЕРАЦИЯ HTML-ОТЧЁТА
+# 10. GENERATE HTML REPORT
 # ============================================================================
-
-function ConvertTo-HtmlText { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
 
 function New-HtmlReport {
-    $t = $script:CountPass + $script:CountWarn + $script:CountFail
-    $pP = 0; $wP = 0; $fP = 0
-    if ($t -gt 0) {
-        $pP = [int][math]::Floor($script:CountPass * 100 / $t)
-        $wP = [int][math]::Floor($script:CountWarn * 100 / $t)
-        $fP = 100 - $pP - $wP
-    }
-    $pw = $pP + $wP
-    $css = @'
-:root{--bg:#0f1115;--panel:#171a21;--border:#262b36;--text:#e6e9ef;--muted:#8b93a7;
-      --pass:#2ecc71;--warn:#f5c542;--fail:#ff5c5c;--info:#5aa9e6;}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:'Segoe UI',Roboto,Arial,sans-serif;line-height:1.5}
-header{padding:28px 40px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,#171a21,#10131a)}
-header h1{margin:0 0 6px;font-size:21px}
-header .meta{color:var(--muted);font-size:13px}
-header .auditor{display:inline-flex;align-items:center;gap:8px;margin-top:10px;background:#1c202a;border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12.5px;color:#c6d0e0}
-header .auditor b{color:var(--text)}
-.wrap{max-width:1100px;margin:0 auto;padding:24px 40px 60px}
-.top-row{display:flex;gap:24px;flex-wrap:wrap;align-items:center;margin:24px 0 10px}
-.summary{display:flex;gap:16px;flex-wrap:wrap;flex:1}
-.card{flex:1;min-width:130px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px 18px}
-.card .num{font-size:28px;font-weight:700}
-.card.pass .num{color:var(--pass)} .card.warn .num{color:var(--warn)}
-.card.fail .num{color:var(--fail)} .card.info .num{color:var(--info)}
-.card .lbl{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
-.bar{height:10px;border-radius:6px;overflow:hidden;display:flex;background:#0b0d12;margin:14px 0 28px;border:1px solid var(--border)}
-.bar span{height:100%}
-.donut-wrap{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:10px}
-.donut{width:150px;height:150px;border-radius:50%;position:relative}
-.donut-hole{position:absolute;inset:16px;border-radius:50%;background:var(--panel);display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px solid var(--border)}
-.donut-hole .pct{font-size:22px;font-weight:700}
-.donut-hole .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
-.donut-legend{display:flex;gap:14px;font-size:11.5px;color:var(--muted)}
-.donut-legend span{display:inline-flex;align-items:center;gap:5px}
-.dot{width:9px;height:9px;border-radius:50%;display:inline-block}
-.dot.pass{background:var(--pass)} .dot.warn{background:var(--warn)} .dot.fail{background:var(--fail)}
-.verdict{padding:14px 18px;border-radius:10px;font-weight:600;margin-bottom:28px;border:1px solid var(--border)}
-.verdict.fail{background:#2a1414;color:var(--fail);border-color:#4a1f1f}
-.verdict.warn{background:#2a2414;color:var(--warn);border-color:#4a3f1f}
-.verdict.pass{background:#132a1b;color:var(--pass);border-color:#1f4a2c}
-section.block{margin-bottom:22px;background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-section.block h2{margin:0;padding:14px 20px;font-size:15px;background:#1c202a;border-bottom:1px solid var(--border)}
-.row{display:flex;gap:12px;padding:9px 20px;border-bottom:1px solid #1d212b;font-size:13.5px;align-items:flex-start}
-.row:last-child{border-bottom:none}
-.badge{flex:0 0 60px;text-align:center;border-radius:5px;padding:2px 0;font-size:11px;font-weight:700;letter-spacing:.03em;height:fit-content}
-.badge.pass{background:#132a1b;color:var(--pass)} .badge.warn{background:#2a2414;color:var(--warn)}
-.badge.fail{background:#2a1414;color:var(--fail)} .badge.info{background:#111f2e;color:var(--info)}
-.msg{flex:1;color:var(--text);word-break:break-word}
-.fix{margin-top:4px;font-size:12px;color:var(--muted)}
-.fix b{color:#c6d0e0}
-footer{color:var(--muted);font-size:12px;text-align:center;padding:24px}
-@media (max-width:600px){header,.wrap{padding-left:16px;padding-right:16px}}
-'@
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">')
-    [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
-    [void]$sb.AppendLine("<title>Аудит безопасности - $(ConvertTo-HtmlText $HostFqdn)</title><style>")
-    [void]$sb.AppendLine($css)
-    [void]$sb.AppendLine('</style></head><body>')
-    [void]$sb.AppendLine(@"
-<header>
-  <h1>Аудит безопасности - CIS Benchmark / ISO 27001 (Windows)</h1>
-  <div class="meta">Хост: $(ConvertTo-HtmlText $HostFqdn) &nbsp;&bull;&nbsp; ОС: $(ConvertTo-HtmlText $OsInfo) &nbsp;&bull;&nbsp; Дата: $(ConvertTo-HtmlText $script:RunTs) &nbsp;&bull;&nbsp; Скрипт v$script:ScriptVersion</div>
-  <div class="auditor">&#128737; Аудитор: <b>$(ConvertTo-HtmlText $script:AuditorName)</b></div>
-</header>
-<div class="wrap">
-  <div class="top-row">
-    <div class="summary">
-      <div class="card pass"><div class="num">$($script:CountPass)</div><div class="lbl">Pass</div></div>
-      <div class="card warn"><div class="num">$($script:CountWarn)</div><div class="lbl">Warn</div></div>
-      <div class="card fail"><div class="num">$($script:CountFail)</div><div class="lbl">Fail</div></div>
-      <div class="card info"><div class="num">$($script:CountInfo)</div><div class="lbl">Info</div></div>
+    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    $total = $script:CountPass + $script:CountWarn + $script:CountFail
+    $score = 0
+    if ($total -gt 0) { $score = [int][math]::Floor(($script:CountPass * 100) / $total) }
+
+    $statusClass = 'status-pass'; $statusText = 'Compliant'
+    if ($script:CountFail -gt 0)     { $statusClass = 'status-fail'; $statusText = 'Immediate Remediation Required' }
+    elseif ($script:CountWarn -gt 0) { $statusClass = 'status-warn'; $statusText = 'Requires Attention' }
+
+    $hostEsc = & $enc $HostFqdn; $osEsc = & $enc $OsInfo; $buildEsc = & $enc $BuildInfo
+    $uptimeEsc = & $enc $UptimeInfo; $tsEsc = & $enc $RunTsText; $auditorEsc = & $enc $script:AuditorName
+
+    $head = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security Audit &mdash; $hostEsc</title>
+<style>
+:root {
+  --bg-main: #0b0f19;
+  --bg-card: #151c2c;
+  --bg-hover: #1e293b;
+  --border-color: #2e3a52;
+  --text-main: #f1f5f9;
+  --text-muted: #94a3b8;
+
+  --pass-color: #10b981;
+  --pass-bg: rgba(16, 185, 129, 0.12);
+  --warn-color: #f59e0b;
+  --warn-bg: rgba(245, 158, 11, 0.12);
+  --fail-color: #ef4444;
+  --fail-bg: rgba(239, 68, 68, 0.12);
+  --info-color: #3b82f6;
+  --info-bg: rgba(59, 130, 246, 0.12);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  line-height: 1.5;
+  padding: 30px 20px;
+}
+
+.container {
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+/* Header UI */
+.header-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 28px;
+  margin-bottom: 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.header-title h1 {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  letter-spacing: -0.02em;
+}
+
+.header-title p {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.status-tag {
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.status-pass { background: var(--pass-bg); color: var(--pass-color); border: 1px solid var(--pass-color); }
+.status-warn { background: var(--warn-bg); color: var(--warn-color); border: 1px solid var(--warn-color); }
+.status-fail { background: var(--fail-bg); color: var(--fail-color); border: 1px solid var(--fail-color); }
+
+/* Executive Grid & Score Ring */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+@media (max-width: 900px) {
+  .dashboard-grid { grid-template-columns: 1fr; }
+}
+
+.score-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.score-ring {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: conic-gradient(var(--pass-color) $($score)%, var(--border-color) 0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 12px;
+  position: relative;
+}
+
+.score-ring-inner {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: var(--bg-card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 800;
+}
+
+.kpi-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.kpi-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.kpi-title {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.kpi-value {
+  font-size: 32px;
+  font-weight: 700;
+}
+
+.kpi-card.pass .kpi-value { color: var(--pass-color); }
+.kpi-card.warn .kpi-value { color: var(--warn-color); }
+.kpi-card.fail .kpi-value { color: var(--fail-color); }
+.kpi-card.info .kpi-value { color: var(--info-color); }
+
+/* System Metadata Box */
+.meta-grid {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 24px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  font-size: 13px;
+}
+
+.meta-item strong {
+  display: block;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+/* Controls & Filter Bar */
+.filter-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.filter-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.chip:hover, .chip.active {
+  background: var(--bg-hover);
+  color: var(--text-main);
+  border-color: var(--text-muted);
+}
+
+.search-input {
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  outline: none;
+  min-width: 240px;
+}
+
+/* Audit Results Table */
+.results-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+th {
+  background: #0f1523;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+th:first-child,
+td:first-child {
+  text-align: center;
+  width: 110px;
+}
+
+td {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 14px;
+  vertical-align: middle;
+}
+
+tr:last-child td { border-bottom: none; }
+tr:hover { background: var(--bg-hover); }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  line-height: 1;
+}
+
+.badge-PASS { background: var(--pass-bg); color: var(--pass-color); border: 1px solid var(--pass-color); }
+.badge-WARN { background: var(--warn-bg); color: var(--warn-color); border: 1px solid var(--warn-color); }
+.badge-FAIL { background: var(--fail-bg); color: var(--fail-color); border: 1px solid var(--fail-color); }
+.badge-INFO { background: var(--info-bg); color: var(--info-color); border: 1px solid var(--info-color); }
+
+.remediation-block {
+  margin-top: 10px;
+  background: #0b0f19;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+  color: #a5b4fc;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.copy-btn {
+  background: var(--border-color);
+  color: var(--text-main);
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.copy-btn:hover { background: var(--text-muted); }
+
+footer {
+  margin-top: 40px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+@media print {
+  body { background: #fff; color: #000; padding: 0; }
+  .filter-bar, .copy-btn { display: none; }
+  .header-card, .score-card, .kpi-card, .meta-grid, .results-card {
+    border: 1px solid #ccc;
+    background: #fff;
+    color: #000;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Header Section -->
+  <div class="header-card">
+    <div class="header-title">
+      <h1>Windows Security Audit Report (CIS / ISO 27001)</h1>
+      <p>Automated technical system compliance verification</p>
     </div>
-    <div class="donut-wrap">
-      <div class="donut" style="background:conic-gradient(var(--pass) 0% ${pP}%, var(--warn) ${pP}% ${pw}%, var(--fail) ${pw}% 100%)">
-        <div class="donut-hole"><div class="pct">${pP}%</div><div class="lbl">PASS</div></div>
+    <span class="status-tag $statusClass">$statusText</span>
+  </div>
+
+  <!-- Executive Summary Section -->
+  <div class="dashboard-grid">
+    <div class="score-card">
+      <div class="score-ring">
+        <div class="score-ring-inner">$($score)%</div>
       </div>
-      <div class="donut-legend">
-        <span><i class="dot pass"></i>Pass $($script:CountPass)</span>
-        <span><i class="dot warn"></i>Warn $($script:CountWarn)</span>
-        <span><i class="dot fail"></i>Fail $($script:CountFail)</span>
+      <div style="font-size:14px; font-weight:600;">Compliance Index</div>
+      <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">Based on CIS Benchmarks checks</div>
+    </div>
+
+    <div class="kpi-cards">
+      <div class="kpi-card pass">
+        <span class="kpi-title">Passed (PASS)</span>
+        <span class="kpi-value">$($script:CountPass)</span>
+      </div>
+      <div class="kpi-card warn">
+        <span class="kpi-title">Warnings (WARN)</span>
+        <span class="kpi-value">$($script:CountWarn)</span>
+      </div>
+      <div class="kpi-card fail">
+        <span class="kpi-title">Failures (FAIL)</span>
+        <span class="kpi-value">$($script:CountFail)</span>
+      </div>
+      <div class="kpi-card info">
+        <span class="kpi-title">Information (INFO)</span>
+        <span class="kpi-value">$($script:CountInfo)</span>
       </div>
     </div>
   </div>
-  <div class="bar"><span style="width:${pP}%;background:var(--pass)"></span><span style="width:${wP}%;background:var(--warn)"></span><span style="width:${fP}%;background:var(--fail)"></span></div>
-"@)
-    if ($script:CountFail -gt 0) {
-        [void]$sb.AppendLine("  <div class=""verdict fail"">Обнаружены критические несоответствия (FAIL: $($script:CountFail)). Требуется устранение перед подтверждением соответствия ISO/IEC 27001.</div>")
-    } elseif ($script:CountWarn -gt 0) {
-        [void]$sb.AppendLine("  <div class=""verdict warn"">Критических несоответствий нет, есть замечания (WARN: $($script:CountWarn)).</div>")
-    } else {
-        [void]$sb.AppendLine('  <div class="verdict pass">Все проверки пройдены успешно.</div>')
-    }
-    $prev = $null; $open = $false
+
+  <!-- Metadata System Box -->
+  <div class="meta-grid">
+    <div class="meta-item"><strong>Target Host</strong>$hostEsc</div>
+    <div class="meta-item"><strong>Operating System</strong>$osEsc</div>
+    <div class="meta-item"><strong>OS Build</strong>$buildEsc</div>
+    <div class="meta-item"><strong>Uptime</strong>$uptimeEsc</div>
+    <div class="meta-item"><strong>Scan Date</strong>$tsEsc</div>
+    <div class="meta-item"><strong>Auditor</strong>$auditorEsc (v$($script:Version))</div>
+  </div>
+
+  <!-- Interactive Controls Bar -->
+  <div class="filter-bar">
+    <div class="filter-chips">
+      <button class="chip active" onclick="filterResults('ALL', this)">All Results</button>
+      <button class="chip" onclick="filterResults('FAIL', this)">FAIL ($($script:CountFail))</button>
+      <button class="chip" onclick="filterResults('WARN', this)">WARN ($($script:CountWarn))</button>
+      <button class="chip" onclick="filterResults('PASS', this)">PASS ($($script:CountPass))</button>
+      <button class="chip" onclick="filterResults('INFO', this)">INFO ($($script:CountInfo))</button>
+    </div>
+    <input type="text" id="searchInput" class="search-input" placeholder="Search checks or sections..." onkeyup="searchTable()">
+  </div>
+
+  <!-- Results Table -->
+  <div class="results-card">
+    <table id="auditTable">
+      <thead>
+        <tr>
+          <th style="width: 110px; text-align: center;">Status</th>
+          <th style="width: 280px;">Section</th>
+          <th>Audit Finding / Actionable Remediation</th>
+        </tr>
+      </thead>
+      <tbody>
+"@
+
+    $rows = New-Object System.Text.StringBuilder
     foreach ($f in $script:Findings) {
-        if ($f.Section -ne $prev) {
-            if ($open) { [void]$sb.AppendLine('  </section>') }
-            [void]$sb.AppendLine("  <section class=""block""><h2>$(ConvertTo-HtmlText $f.Section)</h2>")
-            $open = $true; $prev = $f.Section
+        $lvl = & $enc $f.Level; $sec = & $enc $(if ($f.Section) { $f.Section } else { '-' }); $msg = & $enc $f.Message
+        [void]$rows.AppendLine("<tr class=`"audit-row`" data-status=`"$lvl`">")
+        [void]$rows.AppendLine("  <td style=`"text-align: center;`"><span class=`"badge badge-$lvl`">$lvl</span></td>")
+        [void]$rows.AppendLine("  <td><strong style=`"font-size:13px; color:var(--text-main);`">$sec</strong></td>")
+        [void]$rows.AppendLine('  <td>')
+        [void]$rows.AppendLine("    <div>$msg</div>")
+        if ($f.Remediation) {
+            $remHtml = & $enc $f.Remediation
+            $remJs = & $enc ($f.Remediation.Replace('\', '\\').Replace("'", "\'").Replace("`r", '').Replace("`n", '\n'))
+            [void]$rows.AppendLine('    <div class="remediation-block">')
+            [void]$rows.AppendLine("      <span><strong>Fix:</strong> <code>$remHtml</code></span>")
+            [void]$rows.AppendLine("      <button class=`"copy-btn`" onclick=`"navigator.clipboard.writeText('$remJs')`">Copy</button>")
+            [void]$rows.AppendLine('    </div>')
         }
-        $row = "    <div class=""row""><div class=""badge $($f.Level.ToLower())"">$($f.Level)</div><div class=""msg"">$(ConvertTo-HtmlText $f.Message)"
-        if ($f.Remediation) { $row += "<div class=""fix""><b>Рекомендация:</b> $(ConvertTo-HtmlText $f.Remediation)</div>" }
-        [void]$sb.AppendLine($row + '</div></div>')
+        [void]$rows.AppendLine('  </td>')
+        [void]$rows.AppendLine('</tr>')
     }
-    if ($open) { [void]$sb.AppendLine('  </section>') }
-    [void]$sb.AppendLine("</div><footer>$(ConvertTo-HtmlText $script:AuditorName) &bull; windows_cis_audit.ps1 v$script:ScriptVersion &bull; $(ConvertTo-HtmlText $script:RunTs) &bull; Только для внутреннего использования</footer></body></html>")
-    return $sb.ToString()
+
+    $foot = @"
+      </tbody>
+    </table>
+  </div>
+
+  <footer>
+    Generated automatically by <code>windows_cis_audit.ps1</code> (v$($script:Version)) &copy; $auditorEsc
+  </footer>
+</div>
+
+<script>
+function filterResults(status, btn) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  btn.classList.add('active');
+
+  const rows = document.querySelectorAll('.audit-row');
+  rows.forEach(row => {
+    if (status === 'ALL' || row.getAttribute('data-status') === status) {
+      row.style.display = '';
+    } else {
+      row.style.display = 'none';
+    }
+  });
+}
+
+function searchTable() {
+  const query = document.getElementById('searchInput').value.toLowerCase();
+  const rows = document.querySelectorAll('.audit-row');
+
+  rows.forEach(row => {
+    const text = row.innerText.toLowerCase();
+    row.style.display = text.includes(query) ? '' : 'none';
+  });
+}
+</script>
+
+</body>
+</html>
+"@
+
+    return ($head + $rows.ToString() + $foot)
 }
 
 try {
-    Set-Content -LiteralPath $script:HtmlFile -Value (New-HtmlReport) -Encoding UTF8 -ErrorAction Stop
-    Write-Log "HTML-отчёт сохранён: $script:HtmlFile"
-} catch {
-    Write-Log "[WARN] Не удалось создать HTML-отчёт ${script:HtmlFile}: $($_.Exception.Message)" 'Yellow'
-}
+    $html = New-HtmlReport
+    [System.IO.File]::WriteAllText($HtmlReportFile, $html, (New-Object System.Text.UTF8Encoding($true)))
+    Write-Raw "HTML report saved         : $HtmlReportFile"
+} catch { Write-Raw "[WARN] Failed to write HTML report to ${HtmlReportFile}: $($_.Exception.Message)" 'Yellow' }
 
 exit $ExitCode
